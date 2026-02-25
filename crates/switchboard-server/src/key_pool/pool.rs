@@ -1,11 +1,14 @@
-//! `KeySelector` trait and `KeyPool` skeleton.
+//! `KeySelector` trait and `KeyPool` full implementation.
 //!
 //! Concrete selector implementations (WeightedRandom, RoundRobin, etc.)
 //! live in Phase 5 (`key_pool/selector/`).
 
+use std::time::{Duration, Instant};
+
 use switchboard_common::types::RequestContext;
 
 use crate::key_pool::PooledKey;
+use crate::key_pool::health::KeyStatus;
 
 // ── Selector trait ────────────────────────────────────────────────────────────
 
@@ -19,13 +22,18 @@ pub trait KeySelector: Send + Sync {
     fn select<'a>(&self, pool: &'a [PooledKey], request: &RequestContext) -> Option<&'a PooledKey>;
 }
 
-// ── KeyPool skeleton ──────────────────────────────────────────────────────────
+// ── Error threshold constants ─────────────────────────────────────────────────
+
+/// Number of errors in the last 5 minutes that triggers the Degraded status.
+const DEGRADED_THRESHOLD: u64 = 5;
+
+// ── KeyPool ───────────────────────────────────────────────────────────────────
 
 /// Runtime key pool for one upstream provider.
 ///
 /// Holds an ordered list of [`PooledKey`] entries and delegates selection to
 /// a pluggable [`KeySelector`].  Health updates and rotation algorithms are
-/// implemented in Phase 5.
+/// updated at runtime via the health recording methods.
 pub struct KeyPool {
     pub(crate) keys: Vec<PooledKey>,
     pub(crate) selector: Box<dyn KeySelector>,
@@ -56,6 +64,127 @@ impl KeyPool {
     pub fn select(&self, request: &RequestContext) -> Option<&PooledKey> {
         self.selector.select(&self.keys, request)
     }
+
+    // ── Mutation: adding / removing keys ──────────────────────────────────────
+
+    /// Add a key at runtime (e.g. from the admin API).
+    ///
+    /// If a key with the same `id` already exists it is replaced.
+    pub fn add_key(&mut self, key: PooledKey) {
+        if let Some(existing) = self.keys.iter_mut().find(|k| k.id == key.id) {
+            *existing = key;
+        } else {
+            self.keys.push(key);
+        }
+    }
+
+    /// Remove a key by id.  Returns `true` if a key was found and removed.
+    pub fn remove_key(&mut self, id: &str) -> bool {
+        if let Some(pos) = self.keys.iter().position(|k| k.id == id) {
+            self.keys.remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Mutable access to a key by id, for health updates.
+    pub fn get_key_mut(&mut self, id: &str) -> Option<&mut PooledKey> {
+        self.keys.iter_mut().find(|k| k.id == id)
+    }
+
+    // ── Health recording ──────────────────────────────────────────────────────
+
+    /// Record a successful upstream request.
+    ///
+    /// Increments `total_requests`, updates the exponential moving average of
+    /// latency, and records the last-used timestamp.
+    pub fn record_success(&mut self, key_id: &str, latency: Duration) {
+        let Some(key) = self.get_key_mut(key_id) else {
+            tracing::warn!(key_id, "record_success: key not found");
+            return;
+        };
+
+        key.health.total_requests += 1;
+        key.health.last_used = Some(Instant::now());
+
+        // Exponential moving average: EMA = alpha * sample + (1-alpha) * ema
+        // Use alpha = 0.1 so recent latency is smoothed over ~10 requests.
+        let latency_ms = latency.as_secs_f64() * 1000.0;
+        if key.health.total_requests == 1 {
+            key.health.avg_latency_ms = latency_ms;
+        } else {
+            key.health.avg_latency_ms = 0.1 * latency_ms + 0.9 * key.health.avg_latency_ms;
+        }
+    }
+
+    /// Record a failed upstream request.
+    ///
+    /// Increments `errors_last_5m` (or `rate_limit_hits_last_5m` when
+    /// `is_rate_limit` is `true`) and applies status transition rules:
+    ///
+    /// - `errors_last_5m > 5`              → `Degraded`
+    /// - `rate_limit_hits_last_5m > 0`     → `RateLimited`
+    /// - `Disabled` is never changed here  (admin-only)
+    pub fn record_error(&mut self, key_id: &str, is_rate_limit: bool) {
+        let Some(key) = self.get_key_mut(key_id) else {
+            tracing::warn!(key_id, "record_error: key not found");
+            return;
+        };
+
+        // Never override an administratively disabled key.
+        if key.health.status == KeyStatus::Disabled {
+            return;
+        }
+
+        let now = Instant::now();
+        if is_rate_limit {
+            key.health.rate_limit_hits_last_5m += 1;
+            key.health.last_error = Some((now, "rate_limited".into()));
+            key.health.status = KeyStatus::RateLimited;
+        } else {
+            key.health.errors_last_5m += 1;
+            key.health.last_error = Some((now, "error".into()));
+            if key.health.errors_last_5m > DEGRADED_THRESHOLD {
+                key.health.status = KeyStatus::Degraded;
+            }
+        }
+    }
+
+    /// Mark a key as rate-limited (convenience wrapper around `record_error`).
+    pub fn record_rate_limit(&mut self, key_id: &str) {
+        self.record_error(key_id, true);
+    }
+
+    /// Re-evaluate all keys' statuses based on current error counters.
+    ///
+    /// Call periodically (e.g., every minute) to allow keys to recover.
+    ///
+    /// Transition rules on recheck:
+    ///
+    /// - `Degraded` → `Healthy` if `errors_last_5m == 0`, stays `Degraded` if
+    ///   still above threshold.
+    /// - `RateLimited` → `Healthy` if `rate_limit_hits_last_5m == 0`; or
+    ///   `Degraded` if `errors_last_5m > DEGRADED_THRESHOLD`.
+    /// - `Disabled` is never changed automatically.
+    /// - `Healthy` → `Degraded` if `errors_last_5m` drifted above threshold
+    ///   (guards against races).
+    pub fn recheck_health(&mut self) {
+        for key in &mut self.keys {
+            if key.health.status == KeyStatus::Disabled {
+                continue;
+            }
+
+            let high_errors = key.health.errors_last_5m > DEGRADED_THRESHOLD;
+            let rate_limited = key.health.rate_limit_hits_last_5m > 0;
+
+            key.health.status = match (high_errors, rate_limited) {
+                (_, true) => KeyStatus::RateLimited,
+                (true, false) => KeyStatus::Degraded,
+                (false, false) => KeyStatus::Healthy,
+            };
+        }
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -63,6 +192,7 @@ impl KeyPool {
 #[cfg(test)]
 mod tests {
     use http::{HeaderName, HeaderValue};
+    use proptest::prelude::*;
 
     use super::*;
     use crate::auth::UpstreamCredentials;
@@ -140,5 +270,225 @@ mod tests {
         let p = pool(vec![]);
         let ctx = RequestContext::default();
         assert!(p.select(&ctx).is_none());
+    }
+
+    // ── add_key / remove_key tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_add_key_increases_len() {
+        let mut p = pool(vec![make_key("k1")]);
+        p.add_key(make_key("k2"));
+        assert_eq!(p.len(), 2);
+    }
+
+    #[test]
+    fn test_add_key_replaces_existing_id() {
+        let mut p = pool(vec![make_key("k1")]);
+        let mut replacement = make_key("k1");
+        replacement.weight = 0.5;
+        p.add_key(replacement);
+        assert_eq!(p.len(), 1);
+        assert!((p.keys[0].weight - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_remove_key_returns_true_on_success() {
+        let mut p = pool(vec![make_key("k1"), make_key("k2")]);
+        assert!(p.remove_key("k1"));
+        assert_eq!(p.len(), 1);
+        assert_eq!(p.keys[0].id, "k2");
+    }
+
+    #[test]
+    fn test_remove_key_returns_false_when_not_found() {
+        let mut p = pool(vec![make_key("k1")]);
+        assert!(!p.remove_key("missing"));
+        assert_eq!(p.len(), 1);
+    }
+
+    #[test]
+    fn test_get_key_mut_returns_correct_key() {
+        let mut p = pool(vec![make_key("k1"), make_key("k2")]);
+        let key = p.get_key_mut("k2").unwrap();
+        assert_eq!(key.id, "k2");
+    }
+
+    #[test]
+    fn test_get_key_mut_returns_none_for_missing() {
+        let mut p = pool(vec![make_key("k1")]);
+        assert!(p.get_key_mut("nope").is_none());
+    }
+
+    // ── record_success tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_record_success_increments_requests() {
+        let mut p = pool(vec![make_key("k1")]);
+        p.record_success("k1", Duration::from_millis(100));
+        assert_eq!(p.keys[0].health.total_requests, 1);
+        assert!(p.keys[0].health.last_used.is_some());
+    }
+
+    #[test]
+    fn test_record_success_updates_avg_latency_first_call() {
+        let mut p = pool(vec![make_key("k1")]);
+        p.record_success("k1", Duration::from_millis(200));
+        assert!((p.keys[0].health.avg_latency_ms - 200.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_record_success_ema_subsequent_calls() {
+        let mut p = pool(vec![make_key("k1")]);
+        p.record_success("k1", Duration::from_millis(100)); // sets avg = 100
+        p.record_success("k1", Duration::from_millis(200)); // EMA update
+        // EMA = 0.1 * 200 + 0.9 * 100 = 20 + 90 = 110
+        assert!((p.keys[0].health.avg_latency_ms - 110.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn test_record_success_noop_on_missing_key() {
+        let mut p = pool(vec![make_key("k1")]);
+        // Should not panic.
+        p.record_success("nope", Duration::from_millis(50));
+    }
+
+    // ── record_error tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_record_error_increments_errors() {
+        let mut p = pool(vec![make_key("k1")]);
+        p.record_error("k1", false);
+        assert_eq!(p.keys[0].health.errors_last_5m, 1);
+        assert!(p.keys[0].health.last_error.is_some());
+    }
+
+    #[test]
+    fn test_record_error_transitions_to_degraded_after_threshold() {
+        let mut p = pool(vec![make_key("k1")]);
+        for _ in 0..=DEGRADED_THRESHOLD {
+            p.record_error("k1", false);
+        }
+        assert_eq!(p.keys[0].health.status, KeyStatus::Degraded);
+    }
+
+    #[test]
+    fn test_record_error_rate_limit_transitions_to_rate_limited() {
+        let mut p = pool(vec![make_key("k1")]);
+        p.record_error("k1", true);
+        assert_eq!(p.keys[0].health.status, KeyStatus::RateLimited);
+        assert_eq!(p.keys[0].health.rate_limit_hits_last_5m, 1);
+    }
+
+    #[test]
+    fn test_record_error_does_not_touch_disabled_key() {
+        let mut p = pool(vec![make_key("k1")]);
+        p.keys[0].health.status = KeyStatus::Disabled;
+        p.record_error("k1", false);
+        // Status must remain Disabled and error counter must not change.
+        assert_eq!(p.keys[0].health.status, KeyStatus::Disabled);
+        assert_eq!(p.keys[0].health.errors_last_5m, 0);
+    }
+
+    #[test]
+    fn test_record_rate_limit_is_convenience_wrapper() {
+        let mut p = pool(vec![make_key("k1")]);
+        p.record_rate_limit("k1");
+        assert_eq!(p.keys[0].health.status, KeyStatus::RateLimited);
+    }
+
+    // ── recheck_health tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_recheck_health_recovers_degraded_when_errors_cleared() {
+        let mut p = pool(vec![make_key("k1")]);
+        p.keys[0].health.status = KeyStatus::Degraded;
+        // errors cleared (simulated by a counter reset):
+        p.keys[0].health.errors_last_5m = 0;
+        p.recheck_health();
+        assert_eq!(p.keys[0].health.status, KeyStatus::Healthy);
+    }
+
+    #[test]
+    fn test_recheck_health_keeps_degraded_if_still_above_threshold() {
+        let mut p = pool(vec![make_key("k1")]);
+        p.keys[0].health.errors_last_5m = DEGRADED_THRESHOLD + 1;
+        p.recheck_health();
+        assert_eq!(p.keys[0].health.status, KeyStatus::Degraded);
+    }
+
+    #[test]
+    fn test_recheck_health_recovers_rate_limited_when_hits_cleared() {
+        let mut p = pool(vec![make_key("k1")]);
+        p.keys[0].health.status = KeyStatus::RateLimited;
+        p.keys[0].health.rate_limit_hits_last_5m = 0;
+        p.recheck_health();
+        assert_eq!(p.keys[0].health.status, KeyStatus::Healthy);
+    }
+
+    #[test]
+    fn test_recheck_health_does_not_touch_disabled_key() {
+        let mut p = pool(vec![make_key("k1")]);
+        p.keys[0].health.status = KeyStatus::Disabled;
+        p.recheck_health();
+        assert_eq!(p.keys[0].health.status, KeyStatus::Disabled);
+    }
+
+    // ── Property tests ────────────────────────────────────────────────────────
+
+    proptest! {
+        /// A selector must never return a disabled key regardless of pool composition.
+        #[test]
+        fn prop_selector_never_returns_disabled(
+            num_keys in 1usize..=10,
+            disable_mask in proptest::collection::vec(any::<bool>(), 1..=10),
+        ) {
+            let keys: Vec<PooledKey> = (0..num_keys)
+                .map(|i| {
+                    let mut k = make_key(&format!("k{i}"));
+                    let should_disable = disable_mask.get(i).copied().unwrap_or(false);
+                    if should_disable {
+                        k.health.status = KeyStatus::Disabled;
+                    }
+                    k
+                })
+                .collect();
+
+            let p = pool(keys);
+            let ctx = RequestContext::default();
+
+            if let Some(selected) = p.select(&ctx) {
+                prop_assert_ne!(&selected.health.status, &KeyStatus::Disabled);
+            }
+        }
+    }
+
+    /// WeightedRandom selection is thread-safe under concurrent access.
+    #[test]
+    fn prop_weighted_random_concurrent_access() {
+        use crate::key_pool::selector::WeightedRandomSelector;
+        use std::sync::Arc;
+
+        let keys: Arc<Vec<PooledKey>> =
+            Arc::new((0..5).map(|i| make_key(&format!("k{i}"))).collect());
+        let sel = Arc::new(WeightedRandomSelector);
+        let ctx = Arc::new(RequestContext::default());
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let sel = Arc::clone(&sel);
+                let keys = Arc::clone(&keys);
+                let ctx = Arc::clone(&ctx);
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        let result = sel.select(&keys, &ctx);
+                        assert!(result.is_some());
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }
