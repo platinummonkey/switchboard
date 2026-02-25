@@ -9,7 +9,7 @@ use thiserror::Error;
 // ── Errors ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
-pub enum AuthError {
+pub enum UpstreamAuthError {
     #[error("credential fetch failed: {0}")]
     FetchFailed(String),
 
@@ -74,10 +74,10 @@ pub trait AuthProvider: Send + Sync + 'static {
     fn name(&self) -> &str;
 
     /// Return currently-valid credentials, refreshing if necessary.
-    async fn get_credentials(&self) -> Result<UpstreamCredentials, AuthError>;
+    async fn get_credentials(&self) -> Result<UpstreamCredentials, UpstreamAuthError>;
 
     /// Force-refresh credentials (called after a 401 from upstream).
-    async fn refresh(&self) -> Result<UpstreamCredentials, AuthError>;
+    async fn refresh(&self) -> Result<UpstreamCredentials, UpstreamAuthError>;
 
     /// Fast, synchronous validity check — no I/O.
     fn is_valid(&self) -> bool;
@@ -105,10 +105,10 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
-        async fn get_credentials(&self) -> Result<UpstreamCredentials, AuthError> {
+        async fn get_credentials(&self) -> Result<UpstreamCredentials, UpstreamAuthError> {
             Ok(self.creds.clone())
         }
-        async fn refresh(&self) -> Result<UpstreamCredentials, AuthError> {
+        async fn refresh(&self) -> Result<UpstreamCredentials, UpstreamAuthError> {
             Ok(self.creds.clone())
         }
         fn is_valid(&self) -> bool {
@@ -168,9 +168,9 @@ mod tests {
 
     #[test]
     fn test_auth_error_display() {
-        let e = AuthError::FetchFailed("timeout".into());
+        let e = UpstreamAuthError::FetchFailed("timeout".into());
         assert!(e.to_string().contains("timeout"));
-        let e2 = AuthError::Expired;
+        let e2 = UpstreamAuthError::Expired;
         assert!(e2.to_string().contains("expired"));
     }
 }

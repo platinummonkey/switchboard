@@ -76,6 +76,7 @@ regex = { workspace = true }
 dashmap = { workspace = true }
 arc-swap = { workspace = true }
 rand = { workspace = true }
+subtle = { workspace = true }
 http = "1"
 
 [dev-dependencies]

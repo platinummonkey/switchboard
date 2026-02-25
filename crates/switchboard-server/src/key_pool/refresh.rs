@@ -145,7 +145,7 @@ mod tests {
     use tokio::sync::RwLock;
 
     use super::*;
-    use crate::auth::{AuthError, AuthProvider, UpstreamCredentials};
+    use crate::auth::{AuthProvider, UpstreamAuthError, UpstreamCredentials};
     use crate::key_pool::PooledKey;
 
     // ── Test helpers ──────────────────────────────────────────────────────────
@@ -185,14 +185,14 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
-        async fn get_credentials(&self) -> Result<UpstreamCredentials, AuthError> {
+        async fn get_credentials(&self) -> Result<UpstreamCredentials, UpstreamAuthError> {
             Ok(UpstreamCredentials {
                 header_name: HeaderName::from_static("authorization"),
                 header_value: HeaderValue::from_static("Bearer new-cred"),
                 expires_at: Some(Instant::now() + Duration::from_secs(3600)),
             })
         }
-        async fn refresh(&self) -> Result<UpstreamCredentials, AuthError> {
+        async fn refresh(&self) -> Result<UpstreamCredentials, UpstreamAuthError> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             self.get_credentials().await
         }
@@ -209,11 +209,11 @@ mod tests {
         fn name(&self) -> &str {
             "always-fails"
         }
-        async fn get_credentials(&self) -> Result<UpstreamCredentials, AuthError> {
-            Err(AuthError::FetchFailed("unavailable".into()))
+        async fn get_credentials(&self) -> Result<UpstreamCredentials, UpstreamAuthError> {
+            Err(UpstreamAuthError::FetchFailed("unavailable".into()))
         }
-        async fn refresh(&self) -> Result<UpstreamCredentials, AuthError> {
-            Err(AuthError::RefreshFailed("network error".into()))
+        async fn refresh(&self) -> Result<UpstreamCredentials, UpstreamAuthError> {
+            Err(UpstreamAuthError::RefreshFailed("network error".into()))
         }
         fn is_valid(&self) -> bool {
             false

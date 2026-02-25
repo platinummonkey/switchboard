@@ -79,6 +79,7 @@ regex = "1"
 dashmap = "6"
 arc-swap = "1"
 rand = "0.8"
+subtle = "2"
 
 # Testing
 wiremock = "0.6"
