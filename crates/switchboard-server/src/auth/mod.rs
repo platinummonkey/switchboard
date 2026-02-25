@@ -17,6 +17,7 @@
 //! [`provider::AuthProvider`] supplies credentials injected into upstream
 //! LLM provider requests.
 
+pub mod integration_tests;
 pub mod jwt;
 pub mod mtls;
 pub mod provider;
