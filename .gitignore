@@ -1,0 +1,10 @@
+target/
+Cargo.lock
+.env
+*.env.local
+.DS_Store
+*.pem
+*.key
+*.crt
+dist/
+admin-ui/dist/

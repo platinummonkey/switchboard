@@ -1,0 +1,16 @@
+[server]
+url = "https://switchboard.internal:8080"
+
+[auth]
+method = "api_key"
+
+[identity]
+# Auto-detected from OS user if not set
+# user = "you@example.com"
+# team = "platform"
+
+[local]
+listen = "127.0.0.1:8877"
+
+[model]
+default = "claude-sonnet-4-20250514"

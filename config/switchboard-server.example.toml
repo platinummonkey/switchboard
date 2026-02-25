@@ -1,0 +1,177 @@
+[server]
+listen = "0.0.0.0:8080"
+graceful_shutdown_timeout = "30s"
+
+[admin]
+enabled = true
+listen = "127.0.0.1:9090"
+auth = "jwt"
+jwt_issuer = "https://auth.internal"
+jwt_audience = "switchboard-admin"
+allowed_roles = ["switchboard-admin", "platform-team"]
+
+[identity]
+resolvers = ["header", "jwt", "mtls_cn", "api_key"]
+header_name = "x-switchboard-user"
+jwt_claim = "email"
+
+[auth.validators.jwt]
+type = "jwt"
+jwks_url = "https://auth.internal/.well-known/jwks.json"
+audience = "switchboard"
+issuer = "https://auth.internal"
+
+[auth.validators.api_keys]
+type = "static_keys"
+keys = ["${SWITCHBOARD_API_KEY_1}", "${SWITCHBOARD_API_KEY_2}"]
+
+[providers.anthropic]
+base_url = "https://api.anthropic.com"
+api_format = "anthropic"
+models = ["claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-5-20251001"]
+health_check_interval = "30s"
+timeout = "300s"
+max_concurrent = 100
+
+[providers.anthropic.key_pool]
+selector = "weighted_random"
+
+[[providers.anthropic.key_pool.keys]]
+id = "anthropic-1"
+api_key = "${ANTHROPIC_API_KEY_1}"
+weight = 1.0
+
+[[providers.anthropic.key_pool.keys]]
+id = "anthropic-2"
+api_key = "${ANTHROPIC_API_KEY_2}"
+weight = 1.0
+
+[providers.openai]
+base_url = "https://api.openai.com"
+api_format = "openai"
+models = ["gpt-4o", "gpt-4o-mini", "o1", "o3"]
+
+[providers.openai.key_pool]
+selector = "weighted_random"
+
+[[providers.openai.key_pool.keys]]
+id = "openai-1"
+api_key = "${OPENAI_API_KEY_1}"
+weight = 1.0
+
+[providers.bedrock]
+api_format = "bedrock"
+region = "us-east-1"
+cross_region_inference = true
+models = [
+    "anthropic.claude-sonnet-4-20250514-v1:0",
+    "anthropic.claude-opus-4-20250514-v1:0",
+    "amazon.nova-pro-v1:0",
+]
+
+[providers.bedrock.key_pool]
+selector = "round_robin"
+
+[[providers.bedrock.key_pool.keys]]
+id = "bedrock-east"
+type = "aws_sts"
+role_arn = "arn:aws:iam::123456789:role/switchboard"
+region = "us-east-1"
+refresh_interval = "45m"
+
+[[providers.bedrock.key_pool.keys]]
+id = "bedrock-west"
+type = "aws_sts"
+role_arn = "arn:aws:iam::123456789:role/switchboard"
+region = "us-west-2"
+refresh_interval = "45m"
+
+[providers.ollama]
+base_url = "http://gpu-box.internal:11434"
+api_format = "openai"
+models = ["llama3.3:70b", "codestral:latest"]
+
+[providers.ollama.key_pool]
+selector = "round_robin"
+
+[model_selection]
+mode = "dynamic"
+header = "x-switchboard-model"
+fallback = "claude-sonnet-4-20250514"
+
+[model_selection.mappings]
+"gpt-4" = "claude-sonnet-4-20250514"
+"gpt-4o" = "claude-sonnet-4-20250514"
+"gpt-3.5-turbo" = "claude-haiku-4-5-20251001"
+
+[routing.semantic]
+enabled = true
+classifier = "heuristic"
+
+[[routing.semantic.rules]]
+task_type = "code_generation"
+complexity = "complex"
+preferred_models = ["claude-opus-4-20250514", "o3"]
+fallback_models = ["claude-sonnet-4-20250514", "gpt-4o"]
+
+[[routing.semantic.rules]]
+task_type = "code_generation"
+complexity = "simple"
+preferred_models = ["claude-haiku-4-5-20251001", "gpt-4o-mini"]
+
+[[routing.semantic.rules]]
+task_type = "natural_language"
+complexity = "simple"
+preferred_models = ["claude-haiku-4-5-20251001", "amazon.nova-lite-v1:0"]
+
+[[routing.semantic.rules]]
+task_type = "tool_use"
+preferred_models = ["claude-sonnet-4-20250514", "gpt-4o"]
+
+[routing.semantic.default]
+preferred_models = ["claude-sonnet-4-20250514"]
+
+[guardrails]
+enabled = true
+fail_mode = "open"
+timeout = "500ms"
+streaming_mode = "async_audit"
+
+[[guardrails.engines]]
+type = "builtin_regex"
+phase = "pre_request"
+rules = [
+    { name = "ssn", pattern = "\\b\\d{3}-\\d{2}-\\d{4}\\b", action = "block" },
+    { name = "api_key", pattern = "\\b(sk-|pk_|AKIA)[A-Za-z0-9]{20,}\\b", action = "block" },
+]
+
+[[guardrails.engines]]
+type = "builtin_secret_detection"
+phase = "pre_request"
+action = "block"
+
+[[guardrails.engines]]
+type = "grpc"
+phase = "pre_request"
+endpoint = "guardrails-service.internal:50051"
+tls = true
+timeout = "200ms"
+
+[observability]
+enabled = true
+exporter = "otlp"
+otlp_endpoint = "http://localhost:4317"
+service_name = "switchboard"
+environment = "production"
+sample_rate = 1.0
+capture_prompts = false
+batch_flush_interval = "5s"
+
+[rate_limit]
+enabled = true
+default_rpm = 60
+default_tpm = 100000
+
+[rate_limit.overrides.power-users]
+rpm = 120
+tpm = 500000

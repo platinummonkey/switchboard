@@ -1,0 +1,30 @@
+[server]
+url = "https://switchboard.internal:8080"
+
+[auth]
+# Method: "api_key" | "jwt" | "mtls" | "oauth"
+method = "jwt"
+
+[auth.jwt]
+# Token can be provided directly or obtained via a shell command
+token_command = "vault read -field=token secret/switchboard"
+refresh_interval = "15m"
+
+[auth.mtls]
+cert = "~/.switchboard/client.crt"
+key = "~/.switchboard/client.key"
+ca = "~/.switchboard/ca.crt"
+
+[identity]
+user = "you@example.com"
+team = "platform"
+
+[local]
+listen = "127.0.0.1:8877"
+
+[model]
+default = "claude-sonnet-4-20250514"
+
+[model.overrides]
+"gpt-4" = "claude-sonnet-4-20250514"
+"gpt-4o" = "claude-sonnet-4-20250514"

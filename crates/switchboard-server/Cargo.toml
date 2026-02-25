@@ -1,0 +1,86 @@
+[package]
+name = "switchboard-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "switchboard-server"
+path = "src/main.rs"
+
+[features]
+default = ["admin-ui"]
+admin-ui = ["rust-embed"]
+
+[dependencies]
+switchboard-common = { path = "../switchboard-common" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP framework
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
+
+# gRPC
+tonic = { workspace = true }
+prost = { workspace = true }
+
+# AWS
+aws-sigv4 = { workspace = true }
+aws-credential-types = { workspace = true }
+aws-sdk-sts = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Configuration
+config = { workspace = true }
+dotenvy = { workspace = true }
+
+# Tracing / observability
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-opentelemetry = { workspace = true }
+opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true }
+opentelemetry-otlp = { workspace = true }
+opentelemetry-semantic-conventions = { workspace = true }
+
+# Auth
+jsonwebtoken = { workspace = true }
+
+# Errors
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Static assets (admin UI)
+rust-embed = { workspace = true, optional = true }
+
+# Utilities
+uuid = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+regex = { workspace = true }
+dashmap = { workspace = true }
+arc-swap = { workspace = true }
+http = "1"
+
+[dev-dependencies]
+wiremock = { workspace = true }
+insta = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true }
+tempfile = "3"
+toml = { workspace = true }
