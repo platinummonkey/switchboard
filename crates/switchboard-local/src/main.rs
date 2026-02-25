@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+mod auth;
+#[allow(dead_code)]
 mod config;
 #[allow(dead_code)]
 mod error;
