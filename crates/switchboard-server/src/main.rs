@@ -11,6 +11,8 @@ mod identity;
 #[allow(dead_code, unused_imports)]
 mod key_pool;
 #[allow(dead_code, unused_imports)]
+mod middleware;
+#[allow(dead_code, unused_imports)]
 mod routing;
 
 use anyhow::Result;

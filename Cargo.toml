@@ -78,6 +78,7 @@ chrono = { version = "0.4", features = ["serde"] }
 regex = "1"
 dashmap = "6"
 arc-swap = "1"
+subtle = "2"
 
 # Testing
 wiremock = "0.6"
