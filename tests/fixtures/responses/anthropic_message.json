@@ -1,0 +1,9 @@
+{
+  "id": "msg_abc123",
+  "type": "message",
+  "role": "assistant",
+  "content": [{"type": "text", "text": "The capital of France is Paris."}],
+  "model": "claude-sonnet-4-20250514",
+  "stop_reason": "end_turn",
+  "usage": {"input_tokens": 18, "output_tokens": 9}
+}

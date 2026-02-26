@@ -9,6 +9,7 @@
 
 pub mod error;
 pub mod handler;
+mod property_tests;
 pub mod stream;
 pub mod transform;
 

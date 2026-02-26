@@ -1,0 +1,7 @@
+{
+  "model": "claude-sonnet-4-20250514",
+  "messages": [{"role": "user", "content": "What is the capital of France?"}],
+  "system": "You are a helpful assistant.",
+  "max_tokens": 256,
+  "stream": false
+}
