@@ -117,6 +117,7 @@ struct JwtState {
     /// Shell command to (re-)fetch the token; `None` for static tokens.
     token_command: Option<String>,
     /// How long before expiry to trigger a refresh.
+    #[allow(dead_code)]
     refresh_before_expiry: std::time::Duration,
 }
 
