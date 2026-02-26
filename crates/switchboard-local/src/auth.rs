@@ -8,7 +8,7 @@
 //! - `jwt` — uses a static token or runs a shell command to fetch one; background
 //!   refresh loop re-runs the command before the token expires
 //! - `mtls` — stub (deferred to a later phase)
-//! - `oauth` — stub (deferred to a later phase)
+//! - `oauth` — OAuth2 client_credentials grant with background token refresh
 
 use std::sync::Arc;
 
@@ -121,6 +121,77 @@ struct JwtState {
     refresh_before_expiry: std::time::Duration,
 }
 
+// ── Inner state for OAuth2 mode ───────────────────────────────────────────────
+
+/// OAuth2 token response from the token endpoint.
+#[derive(Debug, Deserialize)]
+struct OAuthTokenResponse {
+    access_token: String,
+    expires_in: Option<u64>,
+}
+
+#[derive(Debug)]
+struct OAuthState {
+    /// Current access token.
+    token: Arc<RwLock<String>>,
+    /// The reqwest client shared with the refresh loop.
+    client: reqwest::Client,
+    /// OAuth2 token endpoint URL.
+    token_url: String,
+    /// OAuth2 client ID.
+    client_id: String,
+    /// OAuth2 client secret (optional — omitted from request body if `None`).
+    client_secret: Option<String>,
+}
+
+// ── OAuth2 token fetch helper ─────────────────────────────────────────────────
+
+/// Fetch an OAuth2 access token via the client_credentials grant.
+///
+/// POSTs `grant_type=client_credentials&client_id=…[&client_secret=…]` to
+/// `token_url` and returns `(access_token, expires_in_secs)`.
+pub async fn fetch_oauth_token(
+    client: &reqwest::Client,
+    token_url: &str,
+    client_id: &str,
+    client_secret: Option<&str>,
+) -> Result<(String, u64), LocalError> {
+    let mut params = vec![
+        ("grant_type", "client_credentials"),
+        ("client_id", client_id),
+    ];
+    if let Some(secret) = client_secret {
+        params.push(("client_secret", secret));
+    }
+
+    let response = client
+        .post(token_url)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| LocalError::Auth(format!("OAuth token request failed: {e}")))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<unreadable body>".into());
+        return Err(LocalError::Auth(format!(
+            "OAuth token endpoint returned {status}: {body}"
+        )));
+    }
+
+    let token_resp: OAuthTokenResponse = response
+        .json()
+        .await
+        .map_err(|e| LocalError::Auth(format!("failed to parse OAuth token response: {e}")))?;
+
+    let expires_in = token_resp.expires_in.unwrap_or(3600);
+    Ok((token_resp.access_token, expires_in))
+}
+
 // ── LocalAuthManager ──────────────────────────────────────────────────────────
 
 /// Manages outgoing authentication headers for `switchboard-local`.
@@ -136,9 +207,10 @@ pub struct LocalAuthManager {
 enum Inner {
     ApiKey(String),
     Jwt(JwtState),
-    /// Stubs — deferred to later phases.
+    /// Stub — deferred to a later phase.
     Mtls,
-    OAuth,
+    /// OAuth2 client_credentials grant.
+    OAuth(OAuthState),
 }
 
 impl LocalAuthManager {
@@ -204,11 +276,64 @@ impl LocalAuthManager {
             }
 
             "oauth" => {
-                tracing::warn!(
-                    "local auth: OAuth mode is not yet implemented in switchboard-local"
+                let oauth_cfg = &config.oauth;
+                if oauth_cfg.client_id.is_empty() {
+                    return Err(LocalError::Auth(
+                        "auth.method is 'oauth' but auth.oauth.client_id is not set".into(),
+                    ));
+                }
+                if oauth_cfg.token_url.is_empty() {
+                    return Err(LocalError::Auth(
+                        "auth.method is 'oauth' but auth.oauth.token_url is not set".into(),
+                    ));
+                }
+
+                let client = reqwest::Client::new();
+                let (initial_token, expires_in) = fetch_oauth_token(
+                    &client,
+                    &oauth_cfg.token_url,
+                    &oauth_cfg.client_id,
+                    oauth_cfg.client_secret.as_deref(),
+                )
+                .await?;
+
+                tracing::info!(
+                    client_id = %oauth_cfg.client_id,
+                    expires_in,
+                    "local auth: OAuth2 client_credentials token acquired"
                 );
+
+                let token_arc = Arc::new(RwLock::new(initial_token));
+
+                let oauth_state = OAuthState {
+                    token: Arc::clone(&token_arc),
+                    client: client.clone(),
+                    token_url: oauth_cfg.token_url.clone(),
+                    client_id: oauth_cfg.client_id.clone(),
+                    client_secret: oauth_cfg.client_secret.clone(),
+                };
+
+                // Spawn the background refresh loop.
+                {
+                    let token_arc_bg = Arc::clone(&token_arc);
+                    let token_url = oauth_cfg.token_url.clone();
+                    let client_id = oauth_cfg.client_id.clone();
+                    let client_secret = oauth_cfg.client_secret.clone();
+                    tokio::spawn(async move {
+                        oauth_refresh_loop(
+                            token_arc_bg,
+                            client,
+                            token_url,
+                            client_id,
+                            client_secret,
+                            expires_in,
+                        )
+                        .await;
+                    });
+                }
+
                 Ok(Self {
-                    inner: Inner::OAuth,
+                    inner: Inner::OAuth(oauth_state),
                 })
             }
 
@@ -233,9 +358,10 @@ impl LocalAuthManager {
                 "mTLS auth is not yet implemented; cannot produce a header".into(),
             )),
 
-            Inner::OAuth => Err(LocalError::Auth(
-                "OAuth auth is not yet implemented; cannot produce a header".into(),
-            )),
+            Inner::OAuth(state) => {
+                let token = state.token.read().await.clone();
+                Ok(("authorization".into(), format!("Bearer {token}")))
+            }
         }
     }
 
@@ -270,9 +396,22 @@ impl LocalAuthManager {
                 "mTLS auth is not yet implemented; cannot refresh".into(),
             )),
 
-            Inner::OAuth => Err(LocalError::Auth(
-                "OAuth auth is not yet implemented; cannot refresh".into(),
-            )),
+            Inner::OAuth(state) => {
+                tracing::info!(
+                    client_id = %state.client_id,
+                    "local auth: forced OAuth2 token refresh"
+                );
+                let (new_token, _) = fetch_oauth_token(
+                    &state.client,
+                    &state.token_url,
+                    &state.client_id,
+                    state.client_secret.as_deref(),
+                )
+                .await?;
+                let mut w = state.token.write().await;
+                *w = new_token;
+                Ok(())
+            }
         }
     }
 }
@@ -315,6 +454,77 @@ async fn jwt_refresh_loop(
                 // Back off briefly before retrying.
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             }
+        }
+    }
+}
+
+// ── Background OAuth2 refresh loop ───────────────────────────────────────────
+
+/// Background task: refreshes the OAuth2 access token before it expires.
+///
+/// Sleeps for `expires_in - 30` seconds, then re-fetches.  On error, retries
+/// with a 30-second backoff up to 5 times before logging and giving up.
+async fn oauth_refresh_loop(
+    token: Arc<RwLock<String>>,
+    client: reqwest::Client,
+    token_url: String,
+    client_id: String,
+    client_secret: Option<String>,
+    initial_expires_in: u64,
+) {
+    const MAX_RETRIES: u32 = 5;
+    const RETRY_BACKOFF_SECS: u64 = 30;
+    const REFRESH_MARGIN_SECS: u64 = 30;
+
+    let mut expires_in = initial_expires_in;
+
+    loop {
+        let sleep_secs = expires_in.saturating_sub(REFRESH_MARGIN_SECS);
+        tracing::debug!(
+            sleep_secs,
+            "OAuth2 refresh loop: sleeping until next refresh"
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
+
+        let mut last_error: Option<LocalError> = None;
+        let mut success = false;
+
+        for attempt in 1..=MAX_RETRIES {
+            match fetch_oauth_token(&client, &token_url, &client_id, client_secret.as_deref()).await
+            {
+                Ok((new_token, new_expires_in)) => {
+                    tracing::info!(
+                        attempt,
+                        new_expires_in,
+                        "OAuth2 refresh loop: token refreshed successfully"
+                    );
+                    expires_in = new_expires_in;
+                    let mut w = token.write().await;
+                    *w = new_token;
+                    success = true;
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        attempt,
+                        error = %e,
+                        "OAuth2 refresh loop: refresh attempt failed; retrying in {RETRY_BACKOFF_SECS}s"
+                    );
+                    last_error = Some(e);
+                    if attempt < MAX_RETRIES {
+                        tokio::time::sleep(std::time::Duration::from_secs(RETRY_BACKOFF_SECS))
+                            .await;
+                    }
+                }
+            }
+        }
+
+        if !success {
+            tracing::error!(
+                error = ?last_error,
+                "OAuth2 refresh loop: exhausted {MAX_RETRIES} retries; giving up"
+            );
+            return;
         }
     }
 }
@@ -548,13 +758,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_oauth_mode_get_header_returns_error() {
+    async fn test_oauth_mode_missing_client_id_returns_error() {
+        // OAuthConfig default has empty client_id and token_url.
         let config = AuthConfig {
             method: "oauth".into(),
             ..AuthConfig::default()
         };
-        let manager = LocalAuthManager::new(&config).await.unwrap();
-        assert!(manager.get_header().await.is_err());
+        assert!(LocalAuthManager::new(&config).await.is_err());
     }
 
     #[tokio::test]
