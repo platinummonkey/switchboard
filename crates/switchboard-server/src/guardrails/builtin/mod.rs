@@ -18,6 +18,7 @@ pub use topic_block_engine::TopicBlockEngine;
 use crate::config::guardrails::EngineConfig;
 use crate::error::ServerError;
 use crate::guardrails::engine::{AuditSeverity, GuardrailAction, GuardrailEngine};
+use crate::guardrails::http_callout::HttpCalloutEngine;
 
 // ── Action helper ─────────────────────────────────────────────────────────────
 
@@ -81,6 +82,7 @@ pub fn engine_from_config(cfg: &EngineConfig) -> Result<Box<dyn GuardrailEngine>
             let engine = TopicBlockEngine::new(topic_name, cfg.keywords.clone(), action)?;
             Ok(Box::new(engine))
         }
+        "http" => Ok(Box::new(HttpCalloutEngine::from_config(cfg)?)),
         other => Err(ServerError::Config(format!(
             "unknown engine type '{other}'"
         ))),
