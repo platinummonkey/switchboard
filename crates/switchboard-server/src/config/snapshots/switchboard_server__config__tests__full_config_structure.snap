@@ -1,0 +1,31 @@
+---
+source: crates/switchboard-server/src/config/mod.rs
+expression: "&structure"
+---
+{
+  "admin_auth": "jwt",
+  "admin_enabled": true,
+  "guardrails_enabled": true,
+  "guardrails_engines_count": 3,
+  "guardrails_fail_mode": "open",
+  "identity_resolvers": [
+    "header",
+    "jwt",
+    "mtls_cn",
+    "api_key"
+  ],
+  "model_selection_fallback": "claude-sonnet-4-20250514",
+  "model_selection_mode": "dynamic",
+  "observability_enabled": true,
+  "provider_names": {
+    "has_anthropic": true,
+    "has_bedrock": true,
+    "has_ollama": true,
+    "has_openai": true
+  },
+  "rate_limit_default_rpm": 60,
+  "rate_limit_enabled": true,
+  "routing_rules_count": 4,
+  "routing_semantic_enabled": true,
+  "server_listen": "0.0.0.0:8080"
+}

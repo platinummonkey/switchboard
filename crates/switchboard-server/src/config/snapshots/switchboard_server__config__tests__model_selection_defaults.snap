@@ -1,0 +1,12 @@
+---
+source: crates/switchboard-server/src/config/mod.rs
+expression: "&cfg"
+---
+{
+  "mode": "dynamic",
+  "header": "x-switchboard-model",
+  "fallback": "claude-sonnet-4-20250514",
+  "mappings": {},
+  "allowed_models": [],
+  "overrides": {}
+}

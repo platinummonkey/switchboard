@@ -1,0 +1,14 @@
+---
+source: crates/switchboard-server/src/config/mod.rs
+expression: "&cfg"
+---
+{
+  "enabled": false,
+  "exporter": "otlp",
+  "otlp_endpoint": "http://localhost:4317",
+  "service_name": "switchboard",
+  "environment": "production",
+  "sample_rate": 1.0,
+  "capture_prompts": false,
+  "batch_flush_interval": "5s"
+}

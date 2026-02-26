@@ -1,0 +1,70 @@
+---
+source: crates/switchboard-server/src/config/mod.rs
+expression: "&cfg"
+---
+{
+  "server": {
+    "listen": "0.0.0.0:8080",
+    "graceful_shutdown_timeout": "30s"
+  },
+  "admin": {
+    "enabled": false,
+    "listen": "127.0.0.1:9090",
+    "auth": "static_token",
+    "allowed_roles": []
+  },
+  "identity": {
+    "resolvers": [
+      "header",
+      "jwt",
+      "api_key"
+    ],
+    "header_name": "x-switchboard-user",
+    "jwt_claim": "email"
+  },
+  "auth": {
+    "validators": {}
+  },
+  "providers": {},
+  "model_selection": {
+    "mode": "dynamic",
+    "header": "x-switchboard-model",
+    "fallback": "claude-sonnet-4-20250514",
+    "mappings": {},
+    "allowed_models": [],
+    "overrides": {}
+  },
+  "routing": {
+    "semantic": {
+      "enabled": false,
+      "classifier": "heuristic",
+      "rules": [],
+      "default": {
+        "preferred_models": []
+      }
+    }
+  },
+  "guardrails": {
+    "enabled": false,
+    "fail_mode": "open",
+    "timeout": "500ms",
+    "streaming_mode": "async_audit",
+    "engines": []
+  },
+  "observability": {
+    "enabled": false,
+    "exporter": "otlp",
+    "otlp_endpoint": "http://localhost:4317",
+    "service_name": "switchboard",
+    "environment": "production",
+    "sample_rate": 1.0,
+    "capture_prompts": false,
+    "batch_flush_interval": "5s"
+  },
+  "rate_limit": {
+    "enabled": false,
+    "default_rpm": 60,
+    "default_tpm": 100000,
+    "overrides": {}
+  }
+}

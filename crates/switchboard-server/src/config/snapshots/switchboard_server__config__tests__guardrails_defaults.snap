@@ -1,0 +1,11 @@
+---
+source: crates/switchboard-server/src/config/mod.rs
+expression: "&cfg"
+---
+{
+  "enabled": false,
+  "fail_mode": "open",
+  "timeout": "500ms",
+  "streaming_mode": "async_audit",
+  "engines": []
+}

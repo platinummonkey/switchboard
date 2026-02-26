@@ -352,4 +352,71 @@ listen = "0.0.0.0:8080"
         let result = load(Path::new("/nonexistent/path/config.toml"));
         assert!(result.is_err());
     }
+
+    // ── Insta snapshots ───────────────────────────────────────────────────────
+
+    /// Snapshot of the default `ServerConfig` as JSON.
+    /// Catches accidental changes to default field values.
+    #[test]
+    fn test_snapshot_server_config_defaults() {
+        let cfg = ServerConfig::default();
+        insta::assert_json_snapshot!("server_config_defaults", &cfg);
+    }
+
+    /// Snapshot of `ModelSelectionConfig` defaults.
+    #[test]
+    fn test_snapshot_model_selection_defaults() {
+        let cfg = crate::config::model_selection::ModelSelectionConfig::default();
+        insta::assert_json_snapshot!("model_selection_defaults", &cfg);
+    }
+
+    /// Snapshot of `GuardrailsConfig` defaults.
+    #[test]
+    fn test_snapshot_guardrails_defaults() {
+        let cfg = crate::config::guardrails::GuardrailsConfig::default();
+        insta::assert_json_snapshot!("guardrails_defaults", &cfg);
+    }
+
+    /// Snapshot of `ObservabilityConfig` defaults.
+    #[test]
+    fn test_snapshot_observability_defaults() {
+        let cfg = crate::config::observability::ObservabilityConfig::default();
+        insta::assert_json_snapshot!("observability_defaults", &cfg);
+    }
+
+    /// Snapshot of the full example config (structure only — provider key values
+    /// are env-var references and will not change).
+    #[test]
+    fn test_snapshot_full_config_structure() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let f = write_toml(include_str!(
+            "../../../../config/switchboard-server.example.toml"
+        ));
+        let cfg = load(f.path()).unwrap();
+        // Snapshot key structural fields rather than the full config to avoid
+        // provider key changes breaking the snapshot unnecessarily.
+        let structure = serde_json::json!({
+            "server_listen": cfg.server.listen,
+            "admin_enabled": cfg.admin.enabled,
+            "admin_auth": cfg.admin.auth,
+            "identity_resolvers": cfg.identity.resolvers,
+            "model_selection_mode": cfg.model_selection.mode,
+            "model_selection_fallback": cfg.model_selection.fallback,
+            "provider_names": {
+                "has_anthropic": cfg.providers.contains_key("anthropic"),
+                "has_openai": cfg.providers.contains_key("openai"),
+                "has_bedrock": cfg.providers.contains_key("bedrock"),
+                "has_ollama": cfg.providers.contains_key("ollama"),
+            },
+            "routing_semantic_enabled": cfg.routing.semantic.enabled,
+            "routing_rules_count": cfg.routing.semantic.rules.len(),
+            "guardrails_enabled": cfg.guardrails.enabled,
+            "guardrails_fail_mode": cfg.guardrails.fail_mode,
+            "guardrails_engines_count": cfg.guardrails.engines.len(),
+            "observability_enabled": cfg.observability.enabled,
+            "rate_limit_enabled": cfg.rate_limit.enabled,
+            "rate_limit_default_rpm": cfg.rate_limit.default_rpm,
+        });
+        insta::assert_json_snapshot!("full_config_structure", &structure);
+    }
 }
