@@ -63,6 +63,8 @@ impl VertexProvider {
 
         let client = reqwest::Client::builder()
             .timeout(timeout)
+            .pool_max_idle_per_host(config.max_concurrent as usize)
+            .tcp_keepalive(Duration::from_secs(90))
             .build()
             .map_err(|e| format!("failed to build reqwest client: {e}"))?;
 
@@ -83,6 +85,8 @@ impl VertexProvider {
     ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(timeout)
+            .pool_max_idle_per_host(64)
+            .tcp_keepalive(Duration::from_secs(90))
             .build()
             .expect("failed to build reqwest client");
 

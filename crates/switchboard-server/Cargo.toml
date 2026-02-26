@@ -97,3 +97,8 @@ tempfile = "3"
 toml = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
 rust-embed = { workspace = true }
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "proxy_bench"
+harness = false

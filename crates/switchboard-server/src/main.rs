@@ -10,6 +10,7 @@ use anyhow::Result;
 use axum::Router;
 use axum::routing::{get, post};
 use http::HeaderValue;
+use tokio::signal;
 
 use switchboard_server::auth::UpstreamCredentials;
 use switchboard_server::config::{self, ServerConfig};
@@ -52,6 +53,12 @@ async fn main() -> Result<()> {
 
     let listen_addr = server_config.server.listen.clone();
 
+    // Extract fields needed after config is moved into AppState.
+    let shutdown_timeout = switchboard_server::config::duration::parse(
+        &server_config.server.graceful_shutdown_timeout,
+    )
+    .unwrap_or(std::time::Duration::from_secs(30));
+
     // Build provider registry and key pools from config.
     let (provider_registry, key_pools) = build_providers(&server_config);
 
@@ -70,9 +77,45 @@ async fn main() -> Result<()> {
 
     tracing::info!(addr = %listen_addr, "listening");
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
-    axum::serve(listener, router).await?;
 
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal(shutdown_timeout))
+        .await?;
+
+    tracing::info!("server shut down cleanly");
     Ok(())
+}
+
+/// Returns a future that resolves when SIGTERM or SIGINT is received,
+/// then waits an additional `drain` period for in-flight requests to finish.
+async fn shutdown_signal(drain: std::time::Duration) {
+    let ctrl_c = async {
+        signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl-C handler");
+    };
+
+    #[cfg(unix)]
+    let sigterm = async {
+        signal::unix::signal(signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let sigterm = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c  => tracing::info!("received Ctrl-C"),
+        _ = sigterm => tracing::info!("received SIGTERM"),
+    }
+
+    tracing::info!(
+        drain_secs = drain.as_secs_f64(),
+        "draining in-flight requests"
+    );
+    tokio::time::sleep(drain).await;
 }
 
 /// Build the [`ProviderRegistry`] and key pools from the server config.
