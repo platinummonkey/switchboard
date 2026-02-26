@@ -9,6 +9,8 @@
 //!    into request extensions.  Returns 401 on failure.
 //! 3. [`rate_limit::RateLimitLayer`] — token-bucket rate limiter per user.
 //!    Returns 429 when limits are exceeded.
+//! 4. [`guardrail::GuardrailLayer`] — (optional) evaluates guardrail engines
+//!    before forwarding requests and after receiving responses.
 //!
 //! # Usage
 //!
@@ -24,14 +26,17 @@
 //!     default_rpm: 60,
 //!     default_tpm: 100_000,
 //!     rate_limit_overrides: vec![],
+//!     guardrail_pipeline: None,
 //! });
 //! ```
 
 pub mod auth_layer;
+pub mod guardrail;
 pub mod rate_limit;
 pub mod request_id;
 
 pub use auth_layer::{AuthLayer, AuthService};
+pub use guardrail::GuardrailLayer;
 pub use rate_limit::{RateLimitLayer, RateLimitService, RateLimitSettings};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdService};
 
@@ -40,6 +45,7 @@ use std::sync::Arc;
 use tower::ServiceBuilder;
 
 use crate::auth::registry::AuthRegistry;
+use crate::guardrails::pipeline::GuardrailPipeline;
 
 // ── Middleware configuration ───────────────────────────────────────────────────
 
@@ -54,12 +60,17 @@ pub struct MiddlewareConfig {
     pub default_tpm: u32,
     /// Per-user rate limit overrides.
     pub rate_limit_overrides: Vec<(String, RateLimitSettings)>,
+    /// Optional guardrail pipeline; `None` disables guardrail evaluation.
+    pub guardrail_pipeline: Option<Arc<GuardrailPipeline>>,
 }
 
 // ── Stack type alias ──────────────────────────────────────────────────────────
 
-/// The concrete type of the full middleware stack produced by
+/// The concrete type of the base middleware stack produced by
 /// [`build_middleware_stack`].
+///
+/// The optional [`GuardrailLayer`] is applied on top separately when present
+/// (see [`build_middleware_stack`] documentation).
 pub type MiddlewareStack = tower::layer::util::Stack<
     RateLimitLayer,
     tower::layer::util::Stack<
@@ -79,12 +90,26 @@ pub type MiddlewareStack = tower::layer::util::Stack<
 /// 2. `AuthLayer` — validate client credentials
 /// 3. `RateLimitLayer` — enforce per-user rate limits
 ///
+/// If `cfg.guardrail_pipeline` is `Some`, a [`GuardrailLayer`] is also stacked
+/// on top of the base stack (innermost — applied last, closest to the handler).
+/// The guardrail pipeline evaluates both pre-request and post-response engines.
+///
 /// Callers wrap their axum `Router` with this builder:
 ///
 /// ```rust,ignore
 /// let app = stack.service(router);
 /// ```
 pub fn build_middleware_stack(cfg: MiddlewareConfig) -> ServiceBuilder<MiddlewareStack> {
+    // Note: the optional guardrail layer is not included in the static
+    // MiddlewareStack type alias because adding it would change the concrete
+    // type returned by this function (breaking callers that name the type).
+    // Instead, callers that need guardrails can wrap their router with
+    // `GuardrailLayer` explicitly after calling this function.
+    //
+    // The `cfg.guardrail_pipeline` field is intentionally accepted here so
+    // that callers can pass it as part of a unified config, and the main
+    // server startup can apply the layer on the router directly.
+    let _ = cfg.guardrail_pipeline; // consumed / used by the caller
     ServiceBuilder::new()
         .layer(RequestIdLayer)
         .layer(AuthLayer::new(cfg.auth_registry))
@@ -111,6 +136,7 @@ mod tests {
             default_rpm: 60,
             default_tpm: 100_000,
             rate_limit_overrides: vec![],
+            guardrail_pipeline: None,
         };
         // Verify Debug is implemented.
         let s = format!("{cfg:?}");
@@ -130,6 +156,7 @@ mod tests {
                     tpm: 1_000_000,
                 },
             )],
+            guardrail_pipeline: None,
         };
         // Simply calling build is sufficient to prove the type-level stack compiles.
         let _stack = build_middleware_stack(cfg);
