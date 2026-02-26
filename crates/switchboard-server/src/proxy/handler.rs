@@ -22,7 +22,7 @@ use switchboard_common::types::RequestContext;
 use crate::auth::ValidatedClient;
 use crate::config::IdentityConfig;
 use crate::config::ServerConfig;
-use crate::identity::{HeaderResolver, IdentityChain, JwtClaimResolver};
+use crate::identity::{HeaderResolver, IdentityChain, JwtClaimResolver, ToolSpecificResolver};
 use crate::key_pool::KeyPool;
 use crate::providers::ProviderRegistry;
 use crate::proxy::error::ProxyError;
@@ -235,15 +235,26 @@ pub async fn health() -> impl IntoResponse {
 
 /// Build an [`IdentityChain`] from the server's identity config.
 ///
-/// Currently supports `"header"` and `"jwt"` resolver strategies.
+/// Currently supports `"header"`, `"jwt"`, and `"tool"` resolver strategies.
+/// `ToolSpecificResolver` is always prepended as the first resolver because it
+/// only enriches the identity (sets the tool source) without overriding
+/// `user_id`. When `"tool"` appears explicitly in `config.resolvers` a second
+/// instance is NOT added.
+///
 /// `"api_key"` and `"mtls_cn"` resolvers require runtime state and are
 /// added to the chain in a future phase.
 fn build_identity_chain(config: &IdentityConfig) -> IdentityChain {
     let mut resolvers: Vec<Box<dyn crate::identity::IdentityResolver>> = Vec::new();
+
+    // Always add ToolSpecificResolver first — it enriches without overriding.
+    resolvers.push(Box::new(ToolSpecificResolver));
+
     for resolver_name in &config.resolvers {
         match resolver_name.as_str() {
             "header" => resolvers.push(Box::new(HeaderResolver)),
             "jwt" => resolvers.push(Box::new(JwtClaimResolver::new(&config.jwt_claim))),
+            // ToolSpecificResolver is already prepended above; skip duplicates.
+            "tool" => {}
             _ => {
                 tracing::debug!(resolver = %resolver_name, "identity resolver not yet wired");
             }
@@ -721,9 +732,9 @@ mod tests {
             jwt_claim: "email".into(),
         };
         let chain = build_identity_chain(&config);
-        // The chain is constructed with 1 resolver.
+        // ToolSpecificResolver is always prepended; "header" adds a second.
         let dbg = format!("{chain:?}");
-        assert!(dbg.contains("resolver_count: 1"));
+        assert!(dbg.contains("resolver_count: 2"));
     }
 
     #[test]
@@ -736,8 +747,9 @@ mod tests {
             jwt_claim: "email".into(),
         };
         let chain = build_identity_chain(&config);
+        // ToolSpecificResolver is always prepended; "jwt" adds a second.
         let dbg = format!("{chain:?}");
-        assert!(dbg.contains("resolver_count: 1"));
+        assert!(dbg.contains("resolver_count: 2"));
     }
 
     #[test]
@@ -750,9 +762,41 @@ mod tests {
             jwt_claim: "email".into(),
         };
         let chain = build_identity_chain(&config);
-        // Only "header" and "jwt" are recognized; "unknown_resolver" is skipped.
+        // ToolSpecificResolver (always) + "header" + "jwt" = 3; "unknown_resolver" is skipped.
+        let dbg = format!("{chain:?}");
+        assert!(dbg.contains("resolver_count: 3"));
+    }
+
+    #[test]
+    fn test_build_identity_chain_tool_resolver_not_duplicated() {
+        use crate::config::IdentityConfig;
+
+        // When "tool" appears explicitly in resolvers, it should NOT be added
+        // a second time (ToolSpecificResolver is already prepended).
+        let config = IdentityConfig {
+            resolvers: vec!["tool".into(), "header".into()],
+            header_name: "x-switchboard-user".into(),
+            jwt_claim: "email".into(),
+        };
+        let chain = build_identity_chain(&config);
+        // ToolSpecificResolver (always) + "header" = 2; "tool" not duplicated.
         let dbg = format!("{chain:?}");
         assert!(dbg.contains("resolver_count: 2"));
+    }
+
+    #[test]
+    fn test_build_identity_chain_empty_resolvers_has_tool_resolver() {
+        use crate::config::IdentityConfig;
+
+        let config = IdentityConfig {
+            resolvers: vec![],
+            header_name: "x-switchboard-user".into(),
+            jwt_claim: "email".into(),
+        };
+        let chain = build_identity_chain(&config);
+        // Even with empty config.resolvers, ToolSpecificResolver is prepended.
+        let dbg = format!("{chain:?}");
+        assert!(dbg.contains("resolver_count: 1"));
     }
 
     #[tokio::test]
