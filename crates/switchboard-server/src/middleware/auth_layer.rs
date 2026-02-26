@@ -15,12 +15,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
-use axum::response::IntoResponse;
 use http::{Request, Response, StatusCode};
 use tower::{Layer, Service};
 
 use crate::auth::registry::AuthRegistry;
-use crate::auth::validator::ValidatedClient;
 
 // ── Layer ─────────────────────────────────────────────────────────────────────
 

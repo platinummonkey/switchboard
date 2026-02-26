@@ -8,6 +8,10 @@ rust-version.workspace = true
 name = "switchboard-server"
 path = "src/main.rs"
 
+[lib]
+name = "switchboard_server"
+path = "src/lib.rs"
+
 [features]
 default = ["admin-ui"]
 admin-ui = ["rust-embed"]
@@ -78,6 +82,7 @@ arc-swap = { workspace = true }
 rand = { workspace = true }
 subtle = { workspace = true }
 http = "1"
+async-stream = "0.3"
 
 [dev-dependencies]
 wiremock = { workspace = true }

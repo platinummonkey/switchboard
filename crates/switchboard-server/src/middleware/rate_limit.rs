@@ -185,6 +185,7 @@ impl RateLimitState {
     /// Update the token count for a user after the actual token usage is known.
     /// `additional_tokens` is added to the current window; intended to be called
     /// after the LLM responds with actual usage.
+    #[allow(dead_code)]
     pub fn record_tokens(&self, user_id: &str, additional_tokens: u32) {
         if let Some(mut bucket) = self.buckets.get_mut(user_id) {
             bucket.tokens = bucket.tokens.saturating_add(additional_tokens);
@@ -193,6 +194,7 @@ impl RateLimitState {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 enum RateLimitReason {
     Rpm {
         limit: u32,

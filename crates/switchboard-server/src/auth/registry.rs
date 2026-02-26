@@ -96,6 +96,7 @@ pub struct AuthRegistryBuilder {
 
 impl AuthRegistryBuilder {
     /// Append a validator to the end of the chain.
+    #[allow(clippy::should_implement_trait)]
     pub fn add(mut self, validator: impl ClientAuthValidator + 'static) -> Self {
         self.validators.push(Arc::new(validator));
         self
