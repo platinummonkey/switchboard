@@ -17,7 +17,10 @@ use switchboard_server::key_pool::{
     KeyPool, KeySelector, LeastLoadedSelector, PooledKey, RoundRobinSelector,
     WeightedRandomSelector,
 };
-use switchboard_server::providers::{AnthropicProvider, OpenAiProvider, ProviderRegistry};
+use switchboard_server::providers::{
+    AnthropicProvider, BedrockProvider, OllamaProvider, OpenAiProvider, ProviderRegistry,
+    VertexProvider,
+};
 use switchboard_server::proxy::handler::{
     AppState, anthropic_messages, chat_completions, health, list_models,
 };
@@ -94,6 +97,33 @@ fn build_providers(config: &ServerConfig) -> (ProviderRegistry, HashMap<String, 
                     tracing::error!(provider = name, error = %e, "failed to build OpenAiProvider");
                 }
             },
+            "bedrock" => match BedrockProvider::new(name, provider_cfg) {
+                Ok(p) => {
+                    registry.register(name, Arc::new(p));
+                    tracing::info!(provider = name, "registered BedrockProvider");
+                }
+                Err(e) => {
+                    tracing::error!(provider = name, error = %e, "failed to build BedrockProvider");
+                }
+            },
+            "vertex" => match VertexProvider::new(name, provider_cfg) {
+                Ok(p) => {
+                    registry.register(name, Arc::new(p));
+                    tracing::info!(provider = name, "registered VertexProvider");
+                }
+                Err(e) => {
+                    tracing::error!(provider = name, error = %e, "failed to build VertexProvider");
+                }
+            },
+            "ollama" => match OllamaProvider::new(name, provider_cfg) {
+                Ok(p) => {
+                    registry.register(name, Arc::new(p));
+                    tracing::info!(provider = name, "registered OllamaProvider");
+                }
+                Err(e) => {
+                    tracing::error!(provider = name, error = %e, "failed to build OllamaProvider");
+                }
+            },
             other => {
                 tracing::warn!(
                     provider = name,
@@ -119,15 +149,23 @@ fn build_providers(config: &ServerConfig) -> (ProviderRegistry, HashMap<String, 
                     return None;
                 }
                 let api_key = entry.api_key.as_deref().unwrap_or("");
-                let header_name = if provider_cfg.api_format == "anthropic" {
-                    http::HeaderName::from_static("x-api-key")
-                } else {
-                    http::HeaderName::from_static("authorization")
-                };
-                let header_value_str = if provider_cfg.api_format == "anthropic" {
-                    api_key.to_string()
-                } else {
-                    format!("Bearer {api_key}")
+                let (header_name, header_value_str) = match provider_cfg.api_format.as_str() {
+                    "anthropic" => (
+                        http::HeaderName::from_static("x-api-key"),
+                        api_key.to_string(),
+                    ),
+                    "bedrock" => {
+                        // For Bedrock, the api_key field holds a JSON credentials
+                        // blob passed verbatim as the x-switchboard-bedrock-creds header.
+                        (
+                            http::HeaderName::from_static("x-switchboard-bedrock-creds"),
+                            api_key.to_string(),
+                        )
+                    }
+                    _ => (
+                        http::HeaderName::from_static("authorization"),
+                        format!("Bearer {api_key}"),
+                    ),
                 };
                 let header_value = HeaderValue::from_str(&header_value_str)
                     .unwrap_or_else(|_| HeaderValue::from_static("invalid"));

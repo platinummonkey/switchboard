@@ -24,7 +24,10 @@ use switchboard_server::key_pool::health::KeyHealth;
 use switchboard_server::key_pool::pool::KeyPool;
 use switchboard_server::key_pool::provider::{KeySource, PooledKey};
 use switchboard_server::key_pool::selector::WeightedRandomSelector;
-use switchboard_server::providers::{AnthropicProvider, OpenAiProvider, ProviderRegistry};
+use switchboard_server::providers::{
+    AnthropicProvider, BedrockProvider, OllamaProvider, OpenAiProvider, ProviderRegistry,
+    VertexProvider,
+};
 use switchboard_server::proxy::handler::{
     AppState, anthropic_messages, chat_completions, health, list_models,
 };
@@ -496,4 +499,258 @@ async fn test_no_key_pool_returns_503() {
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+// ── Phase 8: Bedrock, Vertex, Ollama integration tests ────────────────────────
+
+/// Helper: build an `AppState` with VertexProvider pointing at a mock server.
+fn vertex_app_state(mock_url: &str) -> Arc<AppState> {
+    let provider = Arc::new(VertexProvider::new_with_params(
+        "us-central1",
+        "test-project",
+        vec!["gemini-1.5-pro".into()],
+        Duration::from_secs(10),
+    ));
+
+    let mut registry = ProviderRegistry::new();
+    registry.register("vertex", provider);
+
+    let mut key_pools = HashMap::new();
+    key_pools.insert(
+        "vertex".into(),
+        make_pool(make_key("authorization", "Bearer ya29.test")),
+    );
+
+    let mut config = ServerConfig::default();
+    config.providers.insert(
+        "vertex".into(),
+        ProviderConfig {
+            base_url: Some(mock_url.into()),
+            api_format: "vertex".into(),
+            models: vec!["gemini-1.5-pro".into()],
+            region: Some("us-central1".into()),
+            cross_region_inference: false,
+            project_id: Some("test-project".into()),
+            timeout: "10s".into(),
+            health_check_interval: "30s".into(),
+            max_concurrent: 10,
+            key_pool: KeyPoolConfig::default(),
+        },
+    );
+
+    Arc::new(AppState {
+        config: Arc::new(config),
+        providers: Arc::new(registry),
+        key_pools: Arc::new(key_pools),
+    })
+}
+
+/// Helper: build an `AppState` with OllamaProvider pointing at a mock server.
+fn ollama_app_state(mock_url: &str) -> Arc<AppState> {
+    let provider = Arc::new(OllamaProvider::new_with_base_url(
+        mock_url,
+        vec!["llama3.2".into(), "mistral".into()],
+        Duration::from_secs(10),
+    ));
+
+    let mut registry = ProviderRegistry::new();
+    registry.register("ollama", provider);
+
+    let mut key_pools = HashMap::new();
+    key_pools.insert(
+        "ollama".into(),
+        make_pool(make_key("authorization", "Bearer ollama")),
+    );
+
+    let mut config = ServerConfig::default();
+    config.providers.insert(
+        "ollama".into(),
+        ProviderConfig {
+            base_url: Some(mock_url.into()),
+            api_format: "ollama".into(),
+            models: vec!["llama3.2".into(), "mistral".into()],
+            region: None,
+            cross_region_inference: false,
+            project_id: None,
+            timeout: "10s".into(),
+            health_check_interval: "30s".into(),
+            max_concurrent: 10,
+            key_pool: KeyPoolConfig::default(),
+        },
+    );
+
+    Arc::new(AppState {
+        config: Arc::new(config),
+        providers: Arc::new(registry),
+        key_pools: Arc::new(key_pools),
+    })
+}
+
+/// Non-streaming Bedrock Converse API round-trip through the proxy.
+///
+/// Bedrock uses SigV4 signing and constructs provider-specific URLs
+/// (https://bedrock-runtime.{region}.amazonaws.com/…). We cannot redirect the
+/// provider to wiremock at the proxy-handler level because BedrockProvider
+/// builds its own URL internally. Instead this test verifies:
+///   1. BedrockProvider is correctly registered in the provider registry.
+///   2. Model routing resolves `anthropic.*`, `amazon.*`, `meta.*`, `mistral.*`
+///      prefixes to BedrockProvider.
+///   3. Provider metadata (name, api_format) is correct.
+///
+/// The unit-level network tests in `providers/bedrock.rs` cover SigV4 signing
+/// and actual HTTP interaction with a mock server.
+#[tokio::test]
+async fn test_bedrock_non_streaming() {
+    let creds_json = serde_json::json!({
+        "access_key": "AKIATEST",
+        "secret_key": "testsecret",
+        "session_token": "",
+        "region": "us-east-1"
+    });
+
+    let provider = Arc::new(BedrockProvider::new_with_params(
+        "us-east-1",
+        false,
+        vec!["anthropic.claude-3-sonnet".into()],
+        Duration::from_secs(10),
+    ));
+
+    let mut registry = ProviderRegistry::new();
+    registry.register("bedrock", provider);
+
+    let key = PooledKey {
+        id: "bedrock-key".into(),
+        credentials: UpstreamCredentials {
+            header_name: HeaderName::from_static("x-switchboard-bedrock-creds"),
+            header_value: HeaderValue::from_str(&creds_json.to_string()).unwrap(),
+            expires_at: None,
+        },
+        weight: 1.0,
+        source: KeySource::Static,
+        health: KeyHealth::default(),
+    };
+    let mut key_pools = HashMap::new();
+    key_pools.insert("bedrock".into(), make_pool(key));
+
+    let mut config = ServerConfig::default();
+    config.providers.insert(
+        "bedrock".into(),
+        ProviderConfig {
+            base_url: None,
+            api_format: "bedrock".into(),
+            models: vec!["anthropic.claude-3-sonnet".into()],
+            region: Some("us-east-1".into()),
+            cross_region_inference: false,
+            project_id: None,
+            timeout: "10s".into(),
+            health_check_interval: "30s".into(),
+            max_concurrent: 10,
+            key_pool: KeyPoolConfig::default(),
+        },
+    );
+
+    let state = Arc::new(AppState {
+        config: Arc::new(config),
+        providers: Arc::new(registry),
+        key_pools: Arc::new(key_pools),
+    });
+
+    // Verify that the BedrockProvider is correctly registered and resolves the
+    // model.  The actual network call to the provider will fail (it tries to
+    // reach AWS) but we test routing by checking supports_model and registration.
+    let providers_ref = &state.providers;
+    let providers_config = &state.config.providers;
+    let resolved = providers_ref.resolve_provider("anthropic.claude-3-sonnet", providers_config);
+    assert!(
+        resolved.is_some(),
+        "BedrockProvider should resolve anthropic.claude-3-sonnet"
+    );
+    let (prov, _) = resolved.unwrap();
+    assert_eq!(prov.name(), "bedrock");
+    assert_eq!(prov.api_format(), "bedrock");
+    assert!(prov.supports_model("anthropic.claude-3-sonnet"));
+    assert!(prov.supports_model("amazon.titan-text-express-v1"));
+    assert!(prov.supports_model("meta.llama3-8b-instruct-v1:0"));
+    assert!(prov.supports_model("mistral.mistral-7b-instruct-v0:2"));
+}
+
+/// Non-streaming Vertex AI Gemini round-trip — verifies provider registration
+/// and model resolution.
+#[tokio::test]
+async fn test_vertex_non_streaming() {
+    let state = vertex_app_state("https://us-central1-aiplatform.googleapis.com");
+
+    // Verify registration and routing.
+    let resolved = state
+        .providers
+        .resolve_provider("gemini-1.5-pro", &state.config.providers);
+    assert!(
+        resolved.is_some(),
+        "VertexProvider should resolve gemini-1.5-pro"
+    );
+    let (prov, _) = resolved.unwrap();
+    assert_eq!(prov.name(), "vertex");
+    assert_eq!(prov.api_format(), "vertex");
+    assert!(prov.supports_model("gemini-1.5-pro"));
+    assert!(prov.supports_model("gemini-2.0-flash-exp"));
+    assert!(!prov.supports_model("gpt-4o"));
+}
+
+/// Ollama provider delegates to OpenAI-compatible `/v1/chat/completions` endpoint.
+///
+/// This test makes a real HTTP request through the full proxy pipeline to
+/// confirm Ollama is wired correctly and uses the OpenAI endpoint path.
+#[tokio::test]
+async fn test_ollama_non_streaming() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-ollama-integration",
+            "object": "chat.completion",
+            "model": "llama3.2",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hello from Ollama!"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4, "total_tokens": 12}
+        })))
+        .expect(1)
+        .mount(&mock_server)
+        .await;
+
+    let state = ollama_app_state(&mock_server.uri());
+    let app = build_test_router(state);
+
+    let body = serde_json::json!({
+        "model": "llama3.2",
+        "messages": [
+            {"role": "user", "content": "Hello, Ollama!"}
+        ],
+        "max_tokens": 128
+    });
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp_bytes = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&resp_bytes).unwrap();
+
+    assert_eq!(json["object"], "chat.completion");
+    assert_eq!(
+        json["choices"][0]["message"]["content"],
+        "Hello from Ollama!"
+    );
+    assert_eq!(json["choices"][0]["finish_reason"], "stop");
+    assert_eq!(json["usage"]["prompt_tokens"], 8);
+    assert_eq!(json["usage"]["completion_tokens"], 4);
 }

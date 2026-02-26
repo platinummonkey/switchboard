@@ -410,6 +410,204 @@ pub fn proxied_to_anthropic(resp: &ProxiedResponse) -> serde_json::Value {
     })
 }
 
+// ── Bedrock → internal ───────────────────────────────────────────────────────
+
+/// Serialize a [`ProxiedRequest`] to Amazon Bedrock Converse API JSON format.
+///
+/// This is the canonical helper used by the test suite; the `BedrockProvider`
+/// itself builds its own request body inline.
+pub fn proxied_to_bedrock_converse(req: &ProxiedRequest) -> serde_json::Value {
+    let system_text = req.system.clone().or_else(|| {
+        req.messages
+            .iter()
+            .find(|m| m.role == Role::System)
+            .map(|m| m.content.as_text())
+    });
+
+    let messages: Vec<serde_json::Value> = req
+        .messages
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .map(|msg| {
+            let role = match msg.role {
+                Role::User | Role::Tool => "user",
+                Role::Assistant => "assistant",
+                Role::System => unreachable!("filtered above"),
+            };
+            serde_json::json!({
+                "role": role,
+                "content": [{"text": msg.content.as_text()}],
+            })
+        })
+        .collect();
+
+    let max_tokens = req.max_tokens.unwrap_or(4096);
+    let mut inference_config = serde_json::json!({"maxTokens": max_tokens});
+    if let Some(temp) = req.temperature {
+        inference_config["temperature"] = serde_json::json!(temp);
+    }
+    if let Some(tp) = req.top_p {
+        inference_config["topP"] = serde_json::json!(tp);
+    }
+
+    let mut body = serde_json::json!({
+        "messages": messages,
+        "inferenceConfig": inference_config,
+    });
+
+    if let Some(sys) = system_text {
+        body["system"] = serde_json::json!([{"text": sys}]);
+    }
+
+    body
+}
+
+/// Parse a Bedrock Converse API response body into a [`ProxiedResponse`].
+pub fn bedrock_converse_to_proxied(body: &serde_json::Value) -> ProxiedResponse {
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let content = body
+        .get("output")
+        .and_then(|o| o.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())
+        .and_then(|arr| {
+            arr.iter().find_map(|block| {
+                block
+                    .get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            })
+        })
+        .unwrap_or_default();
+
+    let finish_reason = body
+        .get("stopReason")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let usage = body.get("usage").map(|u| switchboard_common::types::Usage {
+        input_tokens: u.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        output_tokens: u.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+        ..Default::default()
+    });
+
+    ProxiedResponse {
+        model,
+        content,
+        tool_calls: None,
+        finish_reason,
+        usage,
+    }
+}
+
+// ── Vertex → internal ────────────────────────────────────────────────────────
+
+/// Serialize a [`ProxiedRequest`] to Google Vertex AI (Gemini) `generateContent`
+/// request JSON format.
+pub fn proxied_to_vertex_gemini(req: &ProxiedRequest) -> serde_json::Value {
+    let system_text = req.system.clone().or_else(|| {
+        req.messages
+            .iter()
+            .find(|m| m.role == Role::System)
+            .map(|m| m.content.as_text())
+    });
+
+    let contents: Vec<serde_json::Value> = req
+        .messages
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .map(|msg| {
+            let role = match msg.role {
+                Role::User | Role::Tool => "user",
+                Role::Assistant => "model",
+                Role::System => unreachable!("filtered above"),
+            };
+            serde_json::json!({
+                "role": role,
+                "parts": [{"text": msg.content.as_text()}],
+            })
+        })
+        .collect();
+
+    let max_output_tokens = req.max_tokens.unwrap_or(4096);
+    let mut generation_config = serde_json::json!({"maxOutputTokens": max_output_tokens});
+    if let Some(temp) = req.temperature {
+        generation_config["temperature"] = serde_json::json!(temp);
+    }
+    if let Some(tp) = req.top_p {
+        generation_config["topP"] = serde_json::json!(tp);
+    }
+
+    let mut body = serde_json::json!({
+        "contents": contents,
+        "generationConfig": generation_config,
+    });
+
+    if let Some(sys) = system_text {
+        body["systemInstruction"] = serde_json::json!({"parts": [{"text": sys}]});
+    }
+
+    body
+}
+
+/// Parse a Vertex AI `generateContent` response body into a [`ProxiedResponse`].
+pub fn vertex_gemini_to_proxied(body: &serde_json::Value) -> ProxiedResponse {
+    let model = body
+        .get("modelVersion")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let content = body
+        .get("candidates")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("content"))
+        .and_then(|c| c.get("parts"))
+        .and_then(|p| p.as_array())
+        .and_then(|arr| {
+            arr.iter().find_map(|part| {
+                part.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            })
+        })
+        .unwrap_or_default();
+
+    let finish_reason = body
+        .get("candidates")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("finishReason"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let usage = body
+        .get("usageMetadata")
+        .map(|u| switchboard_common::types::Usage {
+            input_tokens: u
+                .get("promptTokenCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            output_tokens: u
+                .get("candidatesTokenCount")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as u32,
+            ..Default::default()
+        });
+
+    ProxiedResponse {
+        model,
+        content,
+        tool_calls: None,
+        finish_reason,
+        usage,
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -744,6 +942,297 @@ mod tests {
             "model": json["model"],
             "stop_reason": json["stop_reason"],
             "usage": json["usage"],
+        });
+        insta::assert_json_snapshot!(snapshot);
+    }
+
+    // ── proxied_to_bedrock_converse ──────────────────────────────────────────
+
+    #[test]
+    fn test_proxied_to_bedrock_converse_basic() {
+        let req = ProxiedRequest {
+            model: "anthropic.claude-3-sonnet".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hello!".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            tools: None,
+            stream: false,
+            max_tokens: Some(256),
+            temperature: Some(0.7),
+            top_p: None,
+            system: None,
+            extra: Default::default(),
+        };
+        let body = proxied_to_bedrock_converse(&req);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"][0]["text"], "Hello!");
+        assert_eq!(body["inferenceConfig"]["maxTokens"], 256);
+        assert!(
+            (body["inferenceConfig"]["temperature"].as_f64().unwrap() - 0.7).abs() < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn test_proxied_to_bedrock_converse_with_system() {
+        let req = ProxiedRequest {
+            model: "anthropic.claude-3-sonnet".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hi".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            tools: None,
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            system: Some("Be helpful.".into()),
+            extra: Default::default(),
+        };
+        let body = proxied_to_bedrock_converse(&req);
+        assert_eq!(body["system"][0]["text"], "Be helpful.");
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_bedrock_converse_to_proxied_basic() {
+        let json = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"text": "Hello from Bedrock!"}]
+                }
+            },
+            "usage": {"inputTokens": 10, "outputTokens": 5},
+            "stopReason": "end_turn"
+        });
+        let resp = bedrock_converse_to_proxied(&json);
+        assert_eq!(resp.content, "Hello from Bedrock!");
+        assert_eq!(resp.finish_reason.as_deref(), Some("end_turn"));
+        let u = resp.usage.unwrap();
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 5);
+    }
+
+    #[test]
+    fn test_bedrock_converse_to_proxied_empty() {
+        let json = serde_json::json!({});
+        let resp = bedrock_converse_to_proxied(&json);
+        assert_eq!(resp.content, "");
+        assert!(resp.finish_reason.is_none());
+        assert!(resp.usage.is_none());
+    }
+
+    // ── proxied_to_vertex_gemini ─────────────────────────────────────────────
+
+    #[test]
+    fn test_proxied_to_vertex_gemini_basic() {
+        let req = ProxiedRequest {
+            model: "gemini-1.5-pro".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("Hello Gemini!".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            tools: None,
+            stream: false,
+            max_tokens: Some(512),
+            temperature: Some(0.5),
+            top_p: None,
+            system: None,
+            extra: Default::default(),
+        };
+        let body = proxied_to_vertex_gemini(&req);
+        let contents = body["contents"].as_array().unwrap();
+        assert_eq!(contents.len(), 1);
+        assert_eq!(contents[0]["role"], "user");
+        assert_eq!(contents[0]["parts"][0]["text"], "Hello Gemini!");
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 512);
+        assert!(
+            (body["generationConfig"]["temperature"].as_f64().unwrap() - 0.5).abs() < f64::EPSILON
+        );
+    }
+
+    #[test]
+    fn test_proxied_to_vertex_gemini_assistant_role() {
+        let req = ProxiedRequest {
+            model: "gemini-1.5-pro".into(),
+            messages: vec![
+                Message {
+                    role: Role::User,
+                    content: MessageContent::Text("Hi".into()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+                Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Text("Hello!".into()),
+                    tool_call_id: None,
+                    tool_calls: None,
+                },
+            ],
+            tools: None,
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            system: None,
+            extra: Default::default(),
+        };
+        let body = proxied_to_vertex_gemini(&req);
+        let contents = body["contents"].as_array().unwrap();
+        assert_eq!(contents[1]["role"], "model");
+    }
+
+    #[test]
+    fn test_proxied_to_vertex_gemini_with_system() {
+        let req = ProxiedRequest {
+            model: "gemini-1.5-pro".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("hi".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            tools: None,
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            top_p: None,
+            system: Some("Be concise.".into()),
+            extra: Default::default(),
+        };
+        let body = proxied_to_vertex_gemini(&req);
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "Be concise.");
+    }
+
+    #[test]
+    fn test_vertex_gemini_to_proxied_basic() {
+        let json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Hello from Gemini!"}],
+                    "role": "model"
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 10,
+                "candidatesTokenCount": 20
+            }
+        });
+        let resp = vertex_gemini_to_proxied(&json);
+        assert_eq!(resp.content, "Hello from Gemini!");
+        assert_eq!(resp.finish_reason.as_deref(), Some("STOP"));
+        let u = resp.usage.unwrap();
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 20);
+    }
+
+    #[test]
+    fn test_vertex_gemini_to_proxied_no_candidates() {
+        let json = serde_json::json!({"candidates": []});
+        let resp = vertex_gemini_to_proxied(&json);
+        assert_eq!(resp.content, "");
+        assert!(resp.finish_reason.is_none());
+    }
+
+    // ── Insta snapshot tests for new transform functions ─────────────────────
+
+    #[test]
+    fn test_snapshot_proxied_to_bedrock_converse() {
+        let req = ProxiedRequest {
+            model: "anthropic.claude-3-sonnet".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("What is 2+2?".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            tools: None,
+            stream: false,
+            max_tokens: Some(256),
+            temperature: Some(0.7),
+            top_p: None,
+            system: Some("Be concise.".into()),
+            extra: Default::default(),
+        };
+        let body = proxied_to_bedrock_converse(&req);
+        insta::assert_json_snapshot!(body);
+    }
+
+    #[test]
+    fn test_snapshot_bedrock_converse_to_proxied() {
+        let json = serde_json::json!({
+            "output": {
+                "message": {
+                    "role": "assistant",
+                    "content": [{"text": "4"}]
+                }
+            },
+            "usage": {"inputTokens": 10, "outputTokens": 2},
+            "stopReason": "end_turn"
+        });
+        let resp = bedrock_converse_to_proxied(&json);
+        let snapshot = serde_json::json!({
+            "content": resp.content,
+            "finish_reason": resp.finish_reason,
+            "input_tokens": resp.usage.as_ref().map(|u| u.input_tokens),
+            "output_tokens": resp.usage.as_ref().map(|u| u.output_tokens),
+        });
+        insta::assert_json_snapshot!(snapshot);
+    }
+
+    #[test]
+    fn test_snapshot_proxied_to_vertex_gemini() {
+        let req = ProxiedRequest {
+            model: "gemini-1.5-pro".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Text("What is 2+2?".into()),
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            tools: None,
+            stream: false,
+            max_tokens: Some(128),
+            temperature: Some(0.5),
+            top_p: None,
+            system: Some("Be concise.".into()),
+            extra: Default::default(),
+        };
+        let body = proxied_to_vertex_gemini(&req);
+        insta::assert_json_snapshot!(body);
+    }
+
+    #[test]
+    fn test_snapshot_vertex_gemini_to_proxied() {
+        let json = serde_json::json!({
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "4"}],
+                    "role": "model"
+                },
+                "finishReason": "STOP"
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 8,
+                "candidatesTokenCount": 2
+            }
+        });
+        let resp = vertex_gemini_to_proxied(&json);
+        let snapshot = serde_json::json!({
+            "content": resp.content,
+            "finish_reason": resp.finish_reason,
+            "input_tokens": resp.usage.as_ref().map(|u| u.input_tokens),
+            "output_tokens": resp.usage.as_ref().map(|u| u.output_tokens),
         });
         insta::assert_json_snapshot!(snapshot);
     }

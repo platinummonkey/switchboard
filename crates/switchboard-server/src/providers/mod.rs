@@ -3,7 +3,10 @@
 //! # Built-in providers
 //!
 //! - [`AnthropicProvider`] — native Anthropic Messages API
-//! - [`OpenAiProvider`] — OpenAI and OpenAI-compatible APIs (Ollama, etc.)
+//! - [`OpenAiProvider`] — OpenAI and OpenAI-compatible APIs
+//! - [`BedrockProvider`] — Amazon Bedrock Converse API (SigV4 signed)
+//! - [`VertexProvider`] — Google Vertex AI (Gemini)
+//! - [`OllamaProvider`] — Ollama (OpenAI-compatible local LLM server)
 //!
 //! # Registry
 //!
@@ -12,10 +15,16 @@
 //! given model name, consulting the [`ProvidersConfig`] for the `models` list.
 
 pub mod anthropic;
+pub mod bedrock;
+pub mod ollama;
 pub mod openai;
+pub mod vertex;
 
 pub use anthropic::AnthropicProvider;
+pub use bedrock::BedrockProvider;
+pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
+pub use vertex::VertexProvider;
 
 use std::collections::HashMap;
 use std::sync::Arc;

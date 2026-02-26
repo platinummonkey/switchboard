@@ -1,0 +1,26 @@
+---
+source: crates/switchboard-server/src/proxy/transform.rs
+assertion_line: 1172
+expression: body
+---
+{
+  "inferenceConfig": {
+    "maxTokens": 256,
+    "temperature": 0.7
+  },
+  "messages": [
+    {
+      "content": [
+        {
+          "text": "What is 2+2?"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "system": [
+    {
+      "text": "Be concise."
+    }
+  ]
+}
