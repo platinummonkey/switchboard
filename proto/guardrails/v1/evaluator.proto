@@ -1,0 +1,43 @@
+syntax = "proto3";
+package guardrails.v1;
+
+service GuardrailEvaluator {
+  rpc EvaluateRequest(EvaluateRequestInput) returns (EvaluateResponse);
+  rpc EvaluateCompletion(EvaluateCompletionInput) returns (EvaluateResponse);
+}
+
+message EvaluateRequestInput {
+  repeated Message messages = 1;
+  string model = 2;
+  string user_id = 3;
+  string team = 4;
+  map<string, string> metadata = 5;
+}
+
+message EvaluateCompletionInput {
+  string completion = 1;
+  repeated Message messages = 2;
+  string model = 3;
+  string user_id = 4;
+  map<string, string> metadata = 5;
+}
+
+message Message {
+  string role = 1;
+  string content = 2;
+}
+
+message EvaluateResponse {
+  Action action = 1;
+  string rule = 2;
+  string reason = 3;
+  double confidence = 4;
+  string modified_content = 5;
+}
+
+enum Action {
+  PASS = 0;
+  BLOCK = 1;
+  MODIFY = 2;
+  AUDIT_LOG = 3;
+}
