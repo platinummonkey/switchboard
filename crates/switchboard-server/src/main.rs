@@ -17,6 +17,7 @@ use switchboard_server::key_pool::{
     KeyPool, KeySelector, LeastLoadedSelector, PooledKey, RoundRobinSelector,
     WeightedRandomSelector,
 };
+use switchboard_server::observability;
 use switchboard_server::providers::{
     AnthropicProvider, BedrockProvider, OllamaProvider, OpenAiProvider, ProviderRegistry,
     VertexProvider,
@@ -45,6 +46,9 @@ async fn main() -> Result<()> {
         );
         ServerConfig::default()
     };
+
+    // Initialise OTel tracing (no-op when observability.enabled = false).
+    let _otel_guard = observability::init_tracing(&server_config.observability)?;
 
     let listen_addr = server_config.server.listen.clone();
 
