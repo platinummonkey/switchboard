@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[lib]
+name = "switchboard_local"
+path = "src/lib.rs"
+
 [[bin]]
 name = "switchboard-local"
 path = "src/main.rs"
