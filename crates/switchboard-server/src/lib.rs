@@ -3,6 +3,7 @@
 //! Re-exports all public modules so they can be referenced from integration
 //! tests without duplicating module declarations.
 
+pub mod admin;
 pub mod auth;
 pub mod config;
 pub mod error;

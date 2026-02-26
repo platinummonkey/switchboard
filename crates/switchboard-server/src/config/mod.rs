@@ -218,6 +218,23 @@ impl HotConfig {
         self.inner.store(Arc::new(fresh));
         Ok(())
     }
+
+    /// Apply a mutation function to the current config and atomically store
+    /// the result.
+    ///
+    /// This clones the current config, applies `f` to the clone, then stores
+    /// it — without reading from disk.  Used by the admin API to update
+    /// in-memory config sub-sections (model selection, guardrails, routing,
+    /// rate limits, key pool entries) without requiring a file on disk.
+    pub fn update<F>(&self, f: F)
+    where
+        F: FnOnce(&mut ServerConfig),
+    {
+        let current = self.inner.load_full();
+        let mut updated = (*current).clone();
+        f(&mut updated);
+        self.inner.store(Arc::new(updated));
+    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
