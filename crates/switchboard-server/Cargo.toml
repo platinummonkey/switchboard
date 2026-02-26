@@ -84,6 +84,9 @@ subtle = { workspace = true }
 http = "1"
 async-stream = "0.3"
 
+[build-dependencies]
+tonic-build = "0.12"
+
 [dev-dependencies]
 wiremock = { workspace = true }
 insta = { workspace = true }
@@ -91,3 +94,4 @@ proptest = { workspace = true }
 tokio = { workspace = true }
 tempfile = "3"
 toml = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
