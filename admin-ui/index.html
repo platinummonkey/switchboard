@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Switchboard Admin</title>
+  <link rel="stylesheet" href="/admin/style.css">
+</head>
+<body>
+  <nav id="sidebar">
+    <div class="nav-header">
+      <span class="nav-logo">Switchboard</span>
+      <span class="nav-subtitle">Admin</span>
+    </div>
+    <ul class="nav-links">
+      <li><a href="#dashboard" class="nav-link" data-page="dashboard">Dashboard</a></li>
+      <li><a href="#key-pools" class="nav-link" data-page="key-pools">Key Pools</a></li>
+      <li><a href="#guardrails" class="nav-link" data-page="guardrails">Guardrails</a></li>
+      <li><a href="#routing" class="nav-link" data-page="routing">Routing</a></li>
+      <li><a href="#rate-limits" class="nav-link" data-page="rate-limits">Rate Limits</a></li>
+      <li><a href="#config" class="nav-link" data-page="config">Config</a></li>
+    </ul>
+  </nav>
+  <main id="app">
+    <div id="page-content"></div>
+  </main>
+  <script src="/admin/app.js"></script>
+</body>
+</html>

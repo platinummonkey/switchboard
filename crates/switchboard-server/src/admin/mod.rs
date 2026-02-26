@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod auth;
+pub mod ui;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -60,6 +61,12 @@ pub fn admin_router(state: Arc<AdminState>) -> axum::Router {
 
     let auth_state = Arc::clone(&state.auth_state);
     let router = api::admin_api_router(state);
+
+    // Mount the embedded admin UI (feature-gated).
+    #[cfg(feature = "admin-ui")]
+    let router = router
+        .route("/admin/", axum::routing::get(ui::serve_ui))
+        .route("/admin/{*path}", axum::routing::get(ui::serve_ui));
 
     // Inject AdminAuthState as an extension on every request.
     router.layer(middleware::from_fn(
