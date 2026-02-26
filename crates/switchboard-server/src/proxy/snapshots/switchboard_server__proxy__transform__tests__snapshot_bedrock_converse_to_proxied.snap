@@ -1,0 +1,11 @@
+---
+source: crates/switchboard-server/src/proxy/transform.rs
+assertion_line: 1194
+expression: snapshot
+---
+{
+  "content": "4",
+  "finish_reason": "end_turn",
+  "input_tokens": 10,
+  "output_tokens": 2
+}

@@ -1,0 +1,28 @@
+---
+source: crates/switchboard-server/src/proxy/transform.rs
+assertion_line: 1216
+expression: body
+---
+{
+  "contents": [
+    {
+      "parts": [
+        {
+          "text": "What is 2+2?"
+        }
+      ],
+      "role": "user"
+    }
+  ],
+  "generationConfig": {
+    "maxOutputTokens": 128,
+    "temperature": 0.5
+  },
+  "systemInstruction": {
+    "parts": [
+      {
+        "text": "Be concise."
+      }
+    ]
+  }
+}
