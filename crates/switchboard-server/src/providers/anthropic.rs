@@ -5,7 +5,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use switchboard_common::errors::SwitchboardError;
-use switchboard_common::types::{ProxiedRequest, ProxiedResponse, Role, Usage};
+use switchboard_common::types::{
+    FunctionCall, ProxiedRequest, ProxiedResponse, Role, ToolCall, Usage,
+};
 
 use crate::config::provider::ProviderConfig;
 use crate::key_pool::PooledKey;
@@ -98,15 +100,59 @@ impl AnthropicProvider {
             .iter()
             .filter(|m| m.role != Role::System)
             .map(|msg| {
-                let role = match msg.role {
-                    Role::User | Role::Tool => "user",
-                    Role::Assistant => "assistant",
+                match msg.role {
+                    Role::Tool => {
+                        // Tool result messages: convert to Anthropic's tool_result format.
+                        let tool_use_id = msg.tool_call_id.as_deref().unwrap_or("").to_string();
+                        serde_json::json!({
+                            "role": "user",
+                            "content": [{
+                                "type": "tool_result",
+                                "tool_use_id": tool_use_id,
+                                "content": msg.content.as_text(),
+                            }],
+                        })
+                    }
+                    Role::Assistant => {
+                        // If the assistant message has tool calls, serialize them
+                        // as tool_use content blocks alongside any text.
+                        if let Some(tool_calls) = &msg.tool_calls {
+                            let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+                            let text = msg.content.as_text();
+                            if !text.is_empty() {
+                                content_blocks
+                                    .push(serde_json::json!({"type": "text", "text": text}));
+                            }
+                            for tc in tool_calls {
+                                let input: serde_json::Value =
+                                    serde_json::from_str(&tc.function.arguments)
+                                        .unwrap_or(serde_json::Value::Object(Default::default()));
+                                content_blocks.push(serde_json::json!({
+                                    "type": "tool_use",
+                                    "id": tc.id,
+                                    "name": tc.function.name,
+                                    "input": input,
+                                }));
+                            }
+                            serde_json::json!({
+                                "role": "assistant",
+                                "content": content_blocks,
+                            })
+                        } else {
+                            serde_json::json!({
+                                "role": "assistant",
+                                "content": msg.content.as_text(),
+                            })
+                        }
+                    }
+                    Role::User => {
+                        serde_json::json!({
+                            "role": "user",
+                            "content": msg.content.as_text(),
+                        })
+                    }
                     Role::System => unreachable!("system messages filtered above"),
-                };
-                serde_json::json!({
-                    "role": role,
-                    "content": msg.content.as_text(),
-                })
+                }
             })
             .collect();
 
@@ -146,27 +192,70 @@ impl AnthropicProvider {
     }
 
     /// Parse an Anthropic Messages API response body into a [`ProxiedResponse`].
+    ///
+    /// Extracts text content from `text` blocks and tool invocations from
+    /// `tool_use` blocks. The `content` field of the response contains only
+    /// the concatenated text; `tool_calls` carries the tool invocations.
     fn parse_response(
         body: &serde_json::Value,
         model: &str,
     ) -> Result<ProxiedResponse, SwitchboardError> {
-        // Extract text content from content array.
-        let content = body
+        let content_blocks = body
             .get("content")
             .and_then(|c| c.as_array())
-            .and_then(|arr| {
-                arr.iter().find_map(|block| {
-                    if block.get("type").and_then(|t| t.as_str()) == Some("text") {
-                        block
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                            .map(|s| s.to_string())
-                    } else {
-                        None
-                    }
-                })
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+
+        // Concatenate all text blocks.
+        let content: String = content_blocks
+            .iter()
+            .filter_map(|block| {
+                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    block
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .map(|s| s.to_string())
+                } else {
+                    None
+                }
             })
-            .unwrap_or_default();
+            .collect::<Vec<_>>()
+            .join("");
+
+        // Extract tool_use blocks as ToolCall objects.
+        let tool_calls: Vec<ToolCall> = content_blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+            .map(|block| {
+                let id = block
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let name = block
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                // Anthropic uses `input` (a JSON object); serialize it back to
+                // a JSON string to match the OpenAI `arguments` convention.
+                let arguments = block
+                    .get("input")
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "{}".to_string());
+                ToolCall {
+                    id,
+                    call_type: "function".to_string(),
+                    function: FunctionCall { name, arguments },
+                }
+            })
+            .collect();
+
+        let tool_calls = if tool_calls.is_empty() {
+            None
+        } else {
+            Some(tool_calls)
+        };
 
         let finish_reason = body
             .get("stop_reason")
@@ -188,7 +277,7 @@ impl AnthropicProvider {
         Ok(ProxiedResponse {
             model: response_model,
             content,
-            tool_calls: None, // Tool call parsing for Anthropic is more complex; deferred.
+            tool_calls,
             finish_reason,
             usage,
         })

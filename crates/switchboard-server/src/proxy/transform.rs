@@ -229,10 +229,35 @@ pub fn proxied_to_openai(resp: &ProxiedResponse) -> serde_json::Value {
         })
     });
 
-    let message = serde_json::json!({
-        "role": "assistant",
-        "content": resp.content,
-    });
+    let (message, finish_reason) = if let Some(tool_calls) = &resp.tool_calls {
+        // When tool calls are present: content is null, finish_reason is "tool_calls".
+        let tc_json: Vec<serde_json::Value> = tool_calls
+            .iter()
+            .map(|tc| {
+                serde_json::json!({
+                    "id": tc.id,
+                    "type": tc.call_type,
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                })
+            })
+            .collect();
+        let msg = serde_json::json!({
+            "role": "assistant",
+            "content": serde_json::Value::Null,
+            "tool_calls": tc_json,
+        });
+        (msg, "tool_calls")
+    } else {
+        let msg = serde_json::json!({
+            "role": "assistant",
+            "content": resp.content,
+        });
+        let fr = resp.finish_reason.as_deref().unwrap_or("stop");
+        (msg, fr)
+    };
 
     serde_json::json!({
         "id": format!("chatcmpl-{}", Uuid::new_v4().simple()),
@@ -241,7 +266,7 @@ pub fn proxied_to_openai(resp: &ProxiedResponse) -> serde_json::Value {
         "choices": [{
             "index": 0,
             "message": message,
-            "finish_reason": resp.finish_reason.as_deref().unwrap_or("stop"),
+            "finish_reason": finish_reason,
         }],
         "usage": usage,
     })
@@ -301,10 +326,56 @@ pub fn anthropic_to_proxied(body: &serde_json::Value) -> Result<ProxiedRequest, 
 }
 
 /// Parse a single Anthropic message object.
+///
+/// Handles the special case of `role: "user"` with `type: "tool_result"` content
+/// blocks — these are converted to `Role::Tool` messages with `tool_call_id`.
 fn parse_anthropic_message(msg: &serde_json::Value, index: usize) -> Result<Message, ProxyError> {
     let role_str = msg.get("role").and_then(|v| v.as_str()).ok_or_else(|| {
         ProxyError::InvalidRequest(format!("messages[{index}]: missing role field"))
     })?;
+
+    // Check for tool_result content blocks (sent back as role: "user").
+    if role_str == "user" {
+        if let Some(serde_json::Value::Array(parts)) = msg.get("content") {
+            // If the first content block is of type "tool_result", treat the
+            // whole message as a Tool role message.
+            let first_is_tool_result = parts
+                .first()
+                .is_some_and(|p| p.get("type").and_then(|t| t.as_str()) == Some("tool_result"));
+            if first_is_tool_result {
+                // Use the first tool_result block as the canonical one.
+                let block = &parts[0];
+                let tool_use_id = block
+                    .get("tool_use_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let content_text = match block.get("content") {
+                    Some(serde_json::Value::String(s)) => s.clone(),
+                    Some(serde_json::Value::Array(arr)) => arr
+                        .iter()
+                        .filter_map(|p| {
+                            if p.get("type").and_then(|t| t.as_str()) == Some("text") {
+                                p.get("text")
+                                    .and_then(|t| t.as_str())
+                                    .map(|s| s.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    _ => String::new(),
+                };
+                return Ok(Message {
+                    role: Role::Tool,
+                    content: MessageContent::Text(content_text),
+                    tool_call_id: Some(tool_use_id),
+                    tool_calls: None,
+                });
+            }
+        }
+    }
 
     let role = match role_str {
         "user" => Role::User,
@@ -315,6 +386,64 @@ fn parse_anthropic_message(msg: &serde_json::Value, index: usize) -> Result<Mess
             )));
         }
     };
+
+    // For assistant messages: extract tool_calls from tool_use content blocks
+    // and text from text content blocks.
+    if role == Role::Assistant {
+        if let Some(serde_json::Value::Array(parts)) = msg.get("content") {
+            let has_tool_use = parts
+                .iter()
+                .any(|p| p.get("type").and_then(|t| t.as_str()) == Some("tool_use"));
+            if has_tool_use {
+                let text_content: String = parts
+                    .iter()
+                    .filter_map(|p| {
+                        if p.get("type").and_then(|t| t.as_str()) == Some("text") {
+                            p.get("text")
+                                .and_then(|t| t.as_str())
+                                .map(|s| s.to_string())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
+                let tool_calls: Vec<ToolCall> = parts
+                    .iter()
+                    .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
+                    .map(|p| {
+                        let id = p
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let name = p
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        let arguments = p
+                            .get("input")
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "{}".to_string());
+                        ToolCall {
+                            id,
+                            call_type: "function".to_string(),
+                            function: FunctionCall { name, arguments },
+                        }
+                    })
+                    .collect();
+
+                return Ok(Message {
+                    role: Role::Assistant,
+                    content: MessageContent::Text(text_content),
+                    tool_call_id: None,
+                    tool_calls: Some(tool_calls),
+                });
+            }
+        }
+    }
 
     let content = parse_anthropic_content(msg, index)?;
 
@@ -399,13 +528,44 @@ pub fn proxied_to_anthropic(resp: &ProxiedResponse) -> serde_json::Value {
         })
     });
 
+    // Build content array: text block + optional tool_use blocks.
+    let mut content_blocks: Vec<serde_json::Value> = Vec::new();
+    if !resp.content.is_empty() {
+        content_blocks.push(serde_json::json!({"type": "text", "text": resp.content}));
+    }
+    if let Some(tool_calls) = &resp.tool_calls {
+        for tc in tool_calls {
+            // Parse arguments back to a JSON object for Anthropic's `input` field.
+            let input: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+            content_blocks.push(serde_json::json!({
+                "type": "tool_use",
+                "id": tc.id,
+                "name": tc.function.name,
+                "input": input,
+            }));
+        }
+    }
+
+    // If there are no content blocks at all, emit an empty text block to
+    // satisfy Anthropic's schema requirement.
+    if content_blocks.is_empty() {
+        content_blocks.push(serde_json::json!({"type": "text", "text": ""}));
+    }
+
+    let stop_reason = if resp.tool_calls.is_some() {
+        "tool_use"
+    } else {
+        resp.finish_reason.as_deref().unwrap_or("end_turn")
+    };
+
     serde_json::json!({
         "id": format!("msg_{}", Uuid::new_v4().simple()),
         "type": "message",
         "role": "assistant",
-        "content": [{"type": "text", "text": resp.content}],
+        "content": content_blocks,
         "model": resp.model,
-        "stop_reason": resp.finish_reason.as_deref().unwrap_or("end_turn"),
+        "stop_reason": stop_reason,
         "usage": usage,
     })
 }
@@ -1235,5 +1395,171 @@ mod tests {
             "output_tokens": resp.usage.as_ref().map(|u| u.output_tokens),
         });
         insta::assert_json_snapshot!(snapshot);
+    }
+
+    // ── Tool call round-trip tests ────────────────────────────────────────────
+
+    /// A `ProxiedRequest` with tools serialized via `AnthropicProvider::build_request_body`
+    /// is tested in `anthropic.rs`; here we verify the `transform` layer directly.
+
+    #[test]
+    fn test_anthropic_to_proxied_extracts_tool_use() {
+        // Anthropic response with a single tool_use block.
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_abc",
+                        "name": "calculator",
+                        "input": {"expression": "2+2"}
+                    }
+                ]
+            }],
+            "max_tokens": 1024
+        });
+        let req = anthropic_to_proxied(&body).unwrap();
+        assert_eq!(req.messages.len(), 1);
+        let msg = &req.messages[0];
+        assert_eq!(msg.role, Role::Assistant);
+        let tc = msg.tool_calls.as_ref().expect("tool_calls should be Some");
+        assert_eq!(tc.len(), 1);
+        assert_eq!(tc[0].id, "toolu_abc");
+        assert_eq!(tc[0].function.name, "calculator");
+        // The arguments should be the JSON representation of the input object.
+        let args: serde_json::Value = serde_json::from_str(&tc[0].function.arguments).unwrap();
+        assert_eq!(args["expression"], "2+2");
+    }
+
+    #[test]
+    fn test_anthropic_to_proxied_mixed_content() {
+        // Anthropic response with text + tool_use blocks.
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "I'll use the calculator."},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_xyz",
+                        "name": "calculator",
+                        "input": {"expression": "3*3"}
+                    }
+                ]
+            }],
+            "max_tokens": 1024
+        });
+        let req = anthropic_to_proxied(&body).unwrap();
+        let msg = &req.messages[0];
+        // Text content should only contain text blocks.
+        assert_eq!(msg.content.as_text(), "I'll use the calculator.");
+        // Tool calls should have the tool_use block.
+        let tc = msg.tool_calls.as_ref().expect("tool_calls should be Some");
+        assert_eq!(tc.len(), 1);
+        assert_eq!(tc[0].id, "toolu_xyz");
+    }
+
+    #[test]
+    fn test_proxied_to_openai_with_tool_calls() {
+        // A ProxiedResponse with tool_calls should produce OpenAI format with
+        // null content and finish_reason "tool_calls".
+        let resp = ProxiedResponse {
+            model: "gpt-4o".into(),
+            content: String::new(),
+            tool_calls: Some(vec![ToolCall {
+                id: "call_123".into(),
+                call_type: "function".into(),
+                function: FunctionCall {
+                    name: "get_weather".into(),
+                    arguments: r#"{"city":"NYC"}"#.into(),
+                },
+            }]),
+            finish_reason: Some("tool_calls".into()),
+            usage: None,
+        };
+        let json = proxied_to_openai(&resp);
+        assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
+        assert!(json["choices"][0]["message"]["content"].is_null());
+        let tcs = &json["choices"][0]["message"]["tool_calls"];
+        assert!(tcs.is_array());
+        assert_eq!(tcs[0]["id"], "call_123");
+        assert_eq!(tcs[0]["function"]["name"], "get_weather");
+        assert_eq!(tcs[0]["function"]["arguments"], r#"{"city":"NYC"}"#);
+    }
+
+    #[test]
+    fn test_openai_to_proxied_tool_role_message() {
+        // OpenAI request with a tool role message (result sent back after tool call).
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                {"role": "user", "content": "What is 2+2?"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_abc",
+                        "type": "function",
+                        "function": {"name": "calculator", "arguments": r#"{"expression":"2+2"}"#}
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_abc",
+                    "content": "4"
+                }
+            ]
+        });
+        let req = openai_to_proxied(&body).unwrap();
+        assert_eq!(req.messages.len(), 3);
+        // Last message should be Role::Tool with tool_call_id.
+        let tool_msg = &req.messages[2];
+        assert_eq!(tool_msg.role, Role::Tool);
+        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("call_abc"));
+        assert_eq!(tool_msg.content.as_text(), "4");
+        // Assistant message should have tool_calls.
+        let asst_msg = &req.messages[1];
+        let tc = asst_msg.tool_calls.as_ref().expect("assistant tool_calls");
+        assert_eq!(tc[0].id, "call_abc");
+        assert_eq!(tc[0].function.name, "calculator");
+    }
+
+    #[test]
+    fn test_anthropic_request_with_tool_result() {
+        // Anthropic request with a tool_result content block (user turn after tool use).
+        let body = serde_json::json!({
+            "model": "claude-sonnet-4-20250514",
+            "messages": [
+                {"role": "user", "content": "What is 2+2?"},
+                {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu_abc",
+                        "name": "calculator",
+                        "input": {"expression": "2+2"}
+                    }]
+                },
+                {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_abc",
+                        "content": "4"
+                    }]
+                }
+            ],
+            "max_tokens": 1024
+        });
+        let req = anthropic_to_proxied(&body).unwrap();
+        assert_eq!(req.messages.len(), 3);
+        // Third message should be converted to Role::Tool.
+        let tool_msg = &req.messages[2];
+        assert_eq!(tool_msg.role, Role::Tool);
+        assert_eq!(tool_msg.tool_call_id.as_deref(), Some("toolu_abc"));
+        assert_eq!(tool_msg.content.as_text(), "4");
     }
 }

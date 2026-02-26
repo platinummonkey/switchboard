@@ -15,8 +15,8 @@ use tokio::signal;
 use switchboard_server::auth::UpstreamCredentials;
 use switchboard_server::config::{self, ServerConfig};
 use switchboard_server::key_pool::{
-    KeyPool, KeySelector, LeastLoadedSelector, PooledKey, RoundRobinSelector,
-    WeightedRandomSelector,
+    AwsStsProvider, KeyPool, KeyProvider, KeySelector, LeastLoadedSelector, PooledKey,
+    RoundRobinSelector, WeightedRandomSelector,
 };
 use switchboard_server::observability;
 use switchboard_server::providers::{
@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
     .unwrap_or(std::time::Duration::from_secs(30));
 
     // Build provider registry and key pools from config.
-    let (provider_registry, key_pools) = build_providers(&server_config);
+    let (provider_registry, key_pools) = build_providers(&server_config).await;
 
     let app_state = Arc::new(AppState {
         config: Arc::new(server_config),
@@ -119,7 +119,9 @@ async fn shutdown_signal(drain: std::time::Duration) {
 }
 
 /// Build the [`ProviderRegistry`] and key pools from the server config.
-fn build_providers(config: &ServerConfig) -> (ProviderRegistry, HashMap<String, Arc<KeyPool>>) {
+async fn build_providers(
+    config: &ServerConfig,
+) -> (ProviderRegistry, HashMap<String, Arc<KeyPool>>) {
     let mut registry = ProviderRegistry::new();
     let mut pools: HashMap<String, Arc<KeyPool>> = HashMap::new();
 
@@ -182,48 +184,87 @@ fn build_providers(config: &ServerConfig) -> (ProviderRegistry, HashMap<String, 
         }
 
         // Build the key pool for this provider.
-        let keys: Vec<PooledKey> = provider_cfg
-            .key_pool
-            .keys
-            .iter()
-            .filter_map(|entry| {
-                if entry.key_type != "static" {
-                    tracing::warn!(
-                        key_id = %entry.id,
-                        key_type = %entry.key_type,
-                        "only static keys supported in this phase, skipping"
-                    );
-                    return None;
-                }
-                let api_key = entry.api_key.as_deref().unwrap_or("");
-                let (header_name, header_value_str) = match provider_cfg.api_format.as_str() {
-                    "anthropic" => (
-                        http::HeaderName::from_static("x-api-key"),
-                        api_key.to_string(),
-                    ),
-                    "bedrock" => {
-                        // For Bedrock, the api_key field holds a JSON credentials
-                        // blob passed verbatim as the x-switchboard-bedrock-creds header.
-                        (
+        let mut keys: Vec<PooledKey> = Vec::new();
+        for entry in &provider_cfg.key_pool.keys {
+            match entry.key_type.as_str() {
+                "static" => {
+                    let api_key = entry.api_key.as_deref().unwrap_or("");
+                    let (header_name, header_value_str) = match provider_cfg.api_format.as_str() {
+                        "anthropic" => (
+                            http::HeaderName::from_static("x-api-key"),
+                            api_key.to_string(),
+                        ),
+                        "bedrock" => (
                             http::HeaderName::from_static("x-switchboard-bedrock-creds"),
                             api_key.to_string(),
-                        )
+                        ),
+                        _ => (
+                            http::HeaderName::from_static("authorization"),
+                            format!("Bearer {api_key}"),
+                        ),
+                    };
+                    let header_value = HeaderValue::from_str(&header_value_str)
+                        .unwrap_or_else(|_| HeaderValue::from_static("invalid"));
+                    let creds = UpstreamCredentials {
+                        header_name,
+                        header_value,
+                        expires_at: None,
+                    };
+                    keys.push(PooledKey::new_static(&entry.id, creds, entry.weight));
+                }
+                "aws_sts" => {
+                    let role_arn = match entry.role_arn.as_deref() {
+                        Some(r) => r,
+                        None => {
+                            tracing::error!(
+                                key_id = %entry.id,
+                                "aws_sts key entry missing role_arn, skipping"
+                            );
+                            continue;
+                        }
+                    };
+                    let region = entry
+                        .region
+                        .as_deref()
+                        .or(provider_cfg.region.as_deref())
+                        .unwrap_or("us-east-1");
+                    let provider = AwsStsProvider::new(role_arn, region);
+                    match provider.fetch().await {
+                        Ok(creds) => {
+                            tracing::info!(
+                                key_id = %entry.id,
+                                role_arn = role_arn,
+                                "fetched initial STS credentials for key"
+                            );
+                            keys.push(PooledKey {
+                                id: entry.id.clone(),
+                                credentials: creds,
+                                weight: entry.weight,
+                                source: switchboard_server::key_pool::KeySource::AwsSts {
+                                    role_arn: role_arn.to_string(),
+                                },
+                                health: switchboard_server::key_pool::KeyHealth::default(),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                key_id = %entry.id,
+                                role_arn = role_arn,
+                                error = %e,
+                                "failed to fetch initial STS credentials, skipping key"
+                            );
+                        }
                     }
-                    _ => (
-                        http::HeaderName::from_static("authorization"),
-                        format!("Bearer {api_key}"),
-                    ),
-                };
-                let header_value = HeaderValue::from_str(&header_value_str)
-                    .unwrap_or_else(|_| HeaderValue::from_static("invalid"));
-                let creds = UpstreamCredentials {
-                    header_name,
-                    header_value,
-                    expires_at: None,
-                };
-                Some(PooledKey::new_static(&entry.id, creds, entry.weight))
-            })
-            .collect();
+                }
+                other => {
+                    tracing::warn!(
+                        key_id = %entry.id,
+                        key_type = other,
+                        "unsupported key type, skipping"
+                    );
+                }
+            }
+        }
 
         let selector: Box<dyn KeySelector> = match provider_cfg.key_pool.selector.as_str() {
             "round_robin" => Box::new(RoundRobinSelector::new()),
