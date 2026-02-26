@@ -1,3 +1,6 @@
+pub mod health;
+pub mod matcher;
+pub mod selector;
 pub mod semantic;
 
 use async_trait::async_trait;
@@ -9,9 +12,12 @@ use switchboard_common::types::{ProxiedRequest, ProxiedResponse};
 
 use crate::key_pool::PooledKey;
 
+pub use health::ProviderHealthChecker;
+pub use matcher::match_routing_rules;
+pub use selector::ModelSelector;
 pub use semantic::{
-    ClassificationInput, ClassificationResult, Complexity, ModelRecommendation, SemanticClassifier,
-    TaskType,
+    ClassificationInput, ClassificationResult, Complexity, HeuristicClassifier,
+    ModelRecommendation, SemanticClassifier, TaskType,
 };
 
 // ── Routing decision ──────────────────────────────────────────────────────────
