@@ -1,0 +1,15 @@
+---
+source: crates/switchboard-server/src/proxy/transform.rs
+expression: snapshot
+---
+{
+  "max_tokens": 128,
+  "messages": [
+    {
+      "content": "What is 2+2?",
+      "role": "user"
+    }
+  ],
+  "model": "claude-sonnet-4-20250514",
+  "system": "Be concise."
+}

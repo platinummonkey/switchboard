@@ -1,0 +1,23 @@
+---
+source: crates/switchboard-server/src/proxy/transform.rs
+expression: snapshot
+---
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "content": "4",
+        "role": "assistant"
+      }
+    }
+  ],
+  "model": "gpt-4o",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 3,
+    "prompt_tokens": 15,
+    "total_tokens": 18
+  }
+}

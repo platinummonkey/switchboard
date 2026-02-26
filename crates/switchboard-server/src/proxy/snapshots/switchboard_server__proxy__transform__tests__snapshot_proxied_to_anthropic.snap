@@ -1,0 +1,20 @@
+---
+source: crates/switchboard-server/src/proxy/transform.rs
+expression: snapshot
+---
+{
+  "content": [
+    {
+      "text": "4",
+      "type": "text"
+    }
+  ],
+  "model": "claude-sonnet-4-20250514",
+  "role": "assistant",
+  "stop_reason": "end_turn",
+  "type": "message",
+  "usage": {
+    "input_tokens": 10,
+    "output_tokens": 2
+  }
+}
