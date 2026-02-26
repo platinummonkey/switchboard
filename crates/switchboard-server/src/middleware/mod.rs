@@ -16,6 +16,8 @@
 //! 5. [`auth_inject::AuthInjectLayer`] — selects a key from the matching
 //!    [`crate::key_pool::KeyPool`] (identified by [`model_override::ProviderName`])
 //!    and inserts [`auth_inject::SelectedKeyId`] into extensions.
+//! 6. [`guardrail::GuardrailLayer`] — (optional) evaluates guardrail engines
+//!    before forwarding requests and after receiving responses.
 //!
 //! # Layer ordering rationale
 //!
@@ -23,6 +25,8 @@
 //!   known for the entire request lifecycle (including auth errors).
 //! - `AuthInjectLayer` runs after `AuthLayer` so `ValidatedClient` is available
 //!   for user-aware key-selection strategies (e.g. sticky selectors).
+//! - `GuardrailLayer` wraps closest to the handler so it sees the final
+//!   resolved request body and the actual upstream response.
 //!
 //! # Usage
 //!
@@ -38,17 +42,24 @@
 //!     default_rpm: 60,
 //!     default_tpm: 100_000,
 //!     rate_limit_overrides: vec![],
+//!     key_pools: Arc::new(std::collections::HashMap::new()),
+//!     model_selector: Arc::new(ModelSelector::new(ModelSelectionConfig::default())),
+//!     provider_registry: Arc::new(ProviderRegistry::new()),
+//!     providers_config: Arc::new(std::collections::HashMap::new()),
+//!     guardrail_pipeline: None,
 //! });
 //! ```
 
 pub mod auth_inject;
 pub mod auth_layer;
+pub mod guardrail;
 pub mod model_override;
 pub mod rate_limit;
 pub mod request_id;
 
 pub use auth_inject::{AuthInjectLayer, AuthInjectService, SelectedKeyId};
 pub use auth_layer::{AuthLayer, AuthService};
+pub use guardrail::GuardrailLayer;
 pub use model_override::{
     ModelOverrideLayer, ModelOverrideService, ProviderName, ResolvedModel, SelectionReasonExt,
 };
@@ -62,6 +73,7 @@ use tower::ServiceBuilder;
 
 use crate::auth::registry::AuthRegistry;
 use crate::config::provider::ProvidersConfig;
+use crate::guardrails::pipeline::GuardrailPipeline;
 use crate::key_pool::KeyPool;
 use crate::providers::ProviderRegistry;
 use crate::routing::ModelSelector;
@@ -87,6 +99,8 @@ pub struct MiddlewareConfig {
     /// Providers configuration — used by [`ModelOverrideLayer`] to resolve
     /// which provider serves each model.
     pub providers_config: Arc<ProvidersConfig>,
+    /// Optional guardrail pipeline; `None` disables guardrail evaluation.
+    pub guardrail_pipeline: Option<Arc<GuardrailPipeline>>,
 }
 
 impl std::fmt::Debug for MiddlewareConfig {
@@ -100,17 +114,22 @@ impl std::fmt::Debug for MiddlewareConfig {
             )
             .field("key_pool_count", &self.key_pools.len())
             .field("provider_registry", &self.provider_registry)
+            .field("guardrail_enabled", &self.guardrail_pipeline.is_some())
             .finish_non_exhaustive()
     }
 }
 
 // ── Stack type alias ──────────────────────────────────────────────────────────
 
-/// The concrete type of the full middleware stack produced by
+/// The concrete type of the base middleware stack produced by
 /// [`build_middleware_stack`].
 ///
 /// Layer order (outermost → innermost, i.e. request traversal order):
 /// `RequestIdLayer → ModelOverrideLayer → AuthLayer → RateLimitLayer → AuthInjectLayer`
+///
+/// The optional [`GuardrailLayer`] is applied on the router directly when
+/// `cfg.guardrail_pipeline` is `Some` — it is not included in this type alias
+/// to avoid changing the concrete return type.
 pub type MiddlewareStack = tower::layer::util::Stack<
     AuthInjectLayer,
     tower::layer::util::Stack<
@@ -138,12 +157,12 @@ pub type MiddlewareStack = tower::layer::util::Stack<
 /// 4. `RateLimitLayer` — enforce per-user rate limits
 /// 5. `AuthInjectLayer` — select upstream key
 ///
-/// Callers wrap their axum `Router` with this builder:
-///
-/// ```rust,ignore
-/// let app = stack.service(router);
-/// ```
+/// If `cfg.guardrail_pipeline` is `Some`, the caller should wrap the axum
+/// `Router` with [`GuardrailLayer`] directly (see `main.rs`).
 pub fn build_middleware_stack(cfg: MiddlewareConfig) -> ServiceBuilder<MiddlewareStack> {
+    // guardrail_pipeline is consumed by the caller — it is available in cfg so
+    // the main server can extract it and apply GuardrailLayer on the router.
+    let _ = cfg.guardrail_pipeline;
     ServiceBuilder::new()
         .layer(RequestIdLayer)
         .layer(ModelOverrideLayer::new(
@@ -183,13 +202,13 @@ mod tests {
             model_selector: Arc::new(ModelSelector::new(ModelSelectionConfig::default())),
             provider_registry: Arc::new(ProviderRegistry::new()),
             providers_config: Arc::new(HashMap::new()),
+            guardrail_pipeline: None,
         }
     }
 
     #[test]
     fn test_middleware_config_debug() {
         let cfg = make_config();
-        // Verify Debug is implemented.
         let s = format!("{cfg:?}");
         assert!(s.contains("MiddlewareConfig"));
     }
@@ -211,8 +230,8 @@ mod tests {
             model_selector: Arc::new(ModelSelector::new(ModelSelectionConfig::default())),
             provider_registry: Arc::new(ProviderRegistry::new()),
             providers_config: Arc::new(HashMap::new()),
+            guardrail_pipeline: None,
         };
-        // Simply calling build is sufficient to prove the type-level stack compiles.
         let _stack = build_middleware_stack(cfg);
     }
 
@@ -243,8 +262,15 @@ mod tests {
             model_selector: Arc::new(ModelSelector::new(ModelSelectionConfig::default())),
             provider_registry: Arc::new(ProviderRegistry::new()),
             providers_config: Arc::new(HashMap::new()),
+            guardrail_pipeline: None,
         };
         assert_eq!(cfg.default_rpm, 10);
         assert_eq!(cfg.rate_limit_overrides.len(), 1);
+    }
+
+    #[test]
+    fn test_guardrail_pipeline_none_by_default() {
+        let cfg = make_config();
+        assert!(cfg.guardrail_pipeline.is_none());
     }
 }

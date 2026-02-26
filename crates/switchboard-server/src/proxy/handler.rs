@@ -13,13 +13,16 @@ use std::sync::Arc;
 use axum::Extension;
 use axum::Json;
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use switchboard_common::types::RequestContext;
 
 use crate::auth::ValidatedClient;
+use crate::config::IdentityConfig;
 use crate::config::ServerConfig;
+use crate::identity::{HeaderResolver, IdentityChain, JwtClaimResolver};
 use crate::key_pool::KeyPool;
 use crate::providers::ProviderRegistry;
 use crate::proxy::error::ProxyError;
@@ -49,7 +52,8 @@ pub struct AppState {
 /// If `stream: true` the response is forwarded as raw SSE.
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
-    Extension(_validated_client): Extension<ValidatedClient>,
+    Extension(validated_client): Extension<ValidatedClient>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let is_streaming = body
@@ -79,10 +83,15 @@ pub async fn chat_completions(
         None => return ProxyError::NoKey(provider_name).into_response(),
     };
 
-    let ctx = RequestContext {
-        model: Some(resolved_model.clone()),
-        ..RequestContext::new()
-    };
+    // Build RequestContext with resolved identity.
+    let ctx = build_request_context(
+        &validated_client,
+        &headers,
+        &state.config.identity,
+        Some(resolved_model.clone()),
+    )
+    .await;
+
     let key = match key_pool.select(&ctx) {
         Some(k) => k,
         None => return ProxyError::NoKey(provider_name).into_response(),
@@ -123,7 +132,8 @@ pub async fn chat_completions(
 /// upstream provider, and returns the response in Anthropic format.
 pub async fn anthropic_messages(
     State(state): State<Arc<AppState>>,
-    Extension(_validated_client): Extension<ValidatedClient>,
+    Extension(validated_client): Extension<ValidatedClient>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
     let is_streaming = body
@@ -153,10 +163,15 @@ pub async fn anthropic_messages(
         None => return ProxyError::NoKey(provider_name).into_response(),
     };
 
-    let ctx = RequestContext {
-        model: Some(resolved_model.clone()),
-        ..RequestContext::new()
-    };
+    // Build RequestContext with resolved identity.
+    let ctx = build_request_context(
+        &validated_client,
+        &headers,
+        &state.config.identity,
+        Some(resolved_model.clone()),
+    )
+    .await;
+
     let key = match key_pool.select(&ctx) {
         Some(k) => k,
         None => return ProxyError::NoKey(provider_name).into_response(),
@@ -214,6 +229,76 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoRespons
 /// Returns `{"status": "ok"}` with HTTP 200.
 pub async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
+}
+
+// ── Identity helpers ──────────────────────────────────────────────────────────
+
+/// Build an [`IdentityChain`] from the server's identity config.
+///
+/// Currently supports `"header"` and `"jwt"` resolver strategies.
+/// `"api_key"` and `"mtls_cn"` resolvers require runtime state and are
+/// added to the chain in a future phase.
+fn build_identity_chain(config: &IdentityConfig) -> IdentityChain {
+    let mut resolvers: Vec<Box<dyn crate::identity::IdentityResolver>> = Vec::new();
+    for resolver_name in &config.resolvers {
+        match resolver_name.as_str() {
+            "header" => resolvers.push(Box::new(HeaderResolver)),
+            "jwt" => resolvers.push(Box::new(JwtClaimResolver::new(&config.jwt_claim))),
+            _ => {
+                tracing::debug!(resolver = %resolver_name, "identity resolver not yet wired");
+            }
+        }
+    }
+    IdentityChain::new(resolvers)
+}
+
+/// Build a [`RequestContext`] with identity resolved from the auth layer and
+/// identity chain.
+///
+/// Steps:
+/// 1. Start from a fresh context with a new request ID.
+/// 2. Populate `user_id` from [`ValidatedClient`] (set by [`AuthLayer`]).
+/// 3. Copy Switchboard protocol headers from the HTTP request headers.
+/// 4. Run the [`IdentityChain`] to resolve / override user and team.
+/// 5. Set the model.
+async fn build_request_context(
+    validated_client: &ValidatedClient,
+    headers: &HeaderMap,
+    identity_config: &IdentityConfig,
+    model: Option<String>,
+) -> RequestContext {
+    let mut ctx = RequestContext::new();
+    ctx.model = model;
+
+    // Seed from ValidatedClient (JWT sub / email claim from AuthLayer).
+    if let Some(uid) = &validated_client.user_id {
+        ctx.user_id = Some(uid.clone());
+    }
+
+    // Copy Switchboard protocol headers into the context.
+    for (name, value) in headers.iter() {
+        if switchboard_common::protocol::is_switchboard_header(name.as_str()) {
+            if let Ok(v) = value.to_str() {
+                ctx.switchboard_headers
+                    .insert(name.to_string(), v.to_string());
+            }
+        }
+    }
+
+    // Run the identity chain to resolve / override user_id and team.
+    let chain = build_identity_chain(identity_config);
+    let identity = chain.resolve(&ctx).await;
+    if !identity.is_anonymous() {
+        tracing::debug!(
+            user_id = %identity.id,
+            source = %identity.source,
+            "identity resolved"
+        );
+        ctx.user_id = Some(identity.id.clone());
+        ctx.team = identity.team.clone();
+    }
+
+    ctx
 }
 
 // ── Streaming response builder ────────────────────────────────────────────────
@@ -622,5 +707,144 @@ mod tests {
 
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // ── Identity tests ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_build_identity_chain_with_header_resolver() {
+        use crate::config::IdentityConfig;
+
+        let config = IdentityConfig {
+            resolvers: vec!["header".into()],
+            header_name: "x-switchboard-user".into(),
+            jwt_claim: "email".into(),
+        };
+        let chain = build_identity_chain(&config);
+        // The chain is constructed with 1 resolver.
+        let dbg = format!("{chain:?}");
+        assert!(dbg.contains("resolver_count: 1"));
+    }
+
+    #[test]
+    fn test_build_identity_chain_with_jwt_resolver() {
+        use crate::config::IdentityConfig;
+
+        let config = IdentityConfig {
+            resolvers: vec!["jwt".into()],
+            header_name: "x-switchboard-user".into(),
+            jwt_claim: "email".into(),
+        };
+        let chain = build_identity_chain(&config);
+        let dbg = format!("{chain:?}");
+        assert!(dbg.contains("resolver_count: 1"));
+    }
+
+    #[test]
+    fn test_build_identity_chain_unknown_resolver_skipped() {
+        use crate::config::IdentityConfig;
+
+        let config = IdentityConfig {
+            resolvers: vec!["header".into(), "unknown_resolver".into(), "jwt".into()],
+            header_name: "x-switchboard-user".into(),
+            jwt_claim: "email".into(),
+        };
+        let chain = build_identity_chain(&config);
+        // Only "header" and "jwt" are recognized; "unknown_resolver" is skipped.
+        let dbg = format!("{chain:?}");
+        assert!(dbg.contains("resolver_count: 2"));
+    }
+
+    #[tokio::test]
+    async fn test_identity_extracted_from_validated_client() {
+        use crate::auth::ValidatedClient;
+        use crate::config::IdentityConfig;
+        use axum::http::HeaderMap;
+
+        let validated_client = ValidatedClient {
+            user_id: Some("alice@example.com".into()),
+            claims: HashMap::new(),
+        };
+        let headers = HeaderMap::new();
+        let identity_config = IdentityConfig {
+            resolvers: vec![], // no chain resolvers — rely on ValidatedClient
+            header_name: "x-switchboard-user".into(),
+            jwt_claim: "email".into(),
+        };
+
+        let ctx = build_request_context(
+            &validated_client,
+            &headers,
+            &identity_config,
+            Some("gpt-4o".into()),
+        )
+        .await;
+
+        assert_eq!(ctx.user_id.as_deref(), Some("alice@example.com"));
+        assert_eq!(ctx.model.as_deref(), Some("gpt-4o"));
+    }
+
+    #[tokio::test]
+    async fn test_identity_chain_overrides_validated_client() {
+        use crate::auth::ValidatedClient;
+        use crate::config::IdentityConfig;
+        use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+        let validated_client = ValidatedClient {
+            user_id: Some("jwt-user@example.com".into()),
+            claims: HashMap::new(),
+        };
+
+        // Set X-Switchboard-User in the request headers — HeaderResolver should pick it up.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-switchboard-user"),
+            HeaderValue::from_static("header-user@example.com"),
+        );
+
+        let identity_config = IdentityConfig {
+            resolvers: vec!["header".into()],
+            header_name: "x-switchboard-user".into(),
+            jwt_claim: "email".into(),
+        };
+
+        let ctx = build_request_context(&validated_client, &headers, &identity_config, None).await;
+
+        // The header resolver should override the ValidatedClient user_id.
+        assert_eq!(ctx.user_id.as_deref(), Some("header-user@example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_switchboard_headers_copied_to_context() {
+        use crate::auth::ValidatedClient;
+        use crate::config::IdentityConfig;
+        use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+        let validated_client = ValidatedClient::from_static_key();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("x-switchboard-team"),
+            HeaderValue::from_static("platform"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-switchboard-tool"),
+            HeaderValue::from_static("claude-code"),
+        );
+
+        let identity_config = IdentityConfig::default();
+        let ctx = build_request_context(&validated_client, &headers, &identity_config, None).await;
+
+        assert_eq!(
+            ctx.switchboard_headers
+                .get("x-switchboard-team")
+                .map(|s| s.as_str()),
+            Some("platform")
+        );
+        assert_eq!(
+            ctx.switchboard_headers
+                .get("x-switchboard-tool")
+                .map(|s| s.as_str()),
+            Some("claude-code")
+        );
     }
 }
