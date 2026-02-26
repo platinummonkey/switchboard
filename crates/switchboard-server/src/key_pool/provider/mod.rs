@@ -1,7 +1,30 @@
-//! Key source variants and the `PooledKey` type.
+//! Key source variants, the `PooledKey` type, and pluggable key providers.
+
+pub mod aws_sts;
+pub mod vault;
+
+use async_trait::async_trait;
 
 use crate::auth::UpstreamCredentials;
+use crate::error::ServerError;
 use crate::key_pool::KeyHealth;
+
+// ── KeyProvider trait ─────────────────────────────────────────────────────────
+
+/// Trait for dynamic key sources that can provide refreshable credentials.
+///
+/// Implement this to add new key sourcing backends (e.g., HashiCorp Vault,
+/// AWS STS, cloud secret managers).
+#[async_trait]
+pub trait KeyProvider: Send + Sync {
+    /// Fetch fresh credentials from this source.
+    async fn fetch(&self) -> Result<UpstreamCredentials, ServerError>;
+    /// Human-readable description for logs.
+    fn description(&self) -> &str;
+}
+
+pub use aws_sts::AwsStsProvider;
+pub use vault::VaultProvider;
 
 // ── Key source ────────────────────────────────────────────────────────────────
 
