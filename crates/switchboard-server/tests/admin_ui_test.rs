@@ -14,6 +14,7 @@ use tower::ServiceExt;
 use switchboard_server::admin::{AdminAuthState, AdminState, admin_router};
 use switchboard_server::config::{AdminConfig, HotConfig, ServerConfig};
 use switchboard_server::key_pool::KeyPool;
+use switchboard_server::middleware::RateLimitLayer;
 
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -30,7 +31,8 @@ fn make_admin_state() -> Arc<AdminState> {
         ..AdminConfig::default()
     };
     let auth_state = Arc::new(AdminAuthState::new(admin_config));
-    Arc::new(AdminState::new(hot_config, pools, auth_state))
+    let (_layer, handle) = RateLimitLayer::new(60, 100_000, std::iter::empty());
+    Arc::new(AdminState::new(hot_config, pools, auth_state, handle))
 }
 
 // ── Asset embedding tests (require admin-ui feature) ─────────────────────────

@@ -37,7 +37,7 @@
 //! use switchboard_server::auth::registry::AuthRegistry;
 //!
 //! let registry = Arc::new(AuthRegistry::new(vec![]));
-//! let stack = build_middleware_stack(MiddlewareConfig {
+//! let (stack, handle) = build_middleware_stack(MiddlewareConfig {
 //!     auth_registry: registry,
 //!     default_rpm: 60,
 //!     default_tpm: 100_000,
@@ -47,6 +47,7 @@
 //!     provider_registry: Arc::new(ProviderRegistry::new()),
 //!     providers_config: Arc::new(std::collections::HashMap::new()),
 //!     guardrail_pipeline: None,
+//!     rate_limit_layer: None,
 //! });
 //! ```
 
@@ -63,7 +64,7 @@ pub use guardrail::GuardrailLayer;
 pub use model_override::{
     ModelOverrideLayer, ModelOverrideService, ProviderName, ResolvedModel, SelectionReasonExt,
 };
-pub use rate_limit::{RateLimitLayer, RateLimitService, RateLimitSettings};
+pub use rate_limit::{RateLimitHandle, RateLimitLayer, RateLimitService, RateLimitSettings};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdService};
 
 use std::collections::HashMap;
@@ -101,6 +102,11 @@ pub struct MiddlewareConfig {
     pub providers_config: Arc<ProvidersConfig>,
     /// Optional guardrail pipeline; `None` disables guardrail evaluation.
     pub guardrail_pipeline: Option<Arc<GuardrailPipeline>>,
+    /// Optional pre-built rate limit layer.  When `Some`, the layer and its
+    /// handle are used directly (allowing the handle to be shared with the
+    /// admin server).  When `None`, a new layer is created from the
+    /// `default_rpm`/`default_tpm`/`rate_limit_overrides` fields.
+    pub rate_limit_layer: Option<(RateLimitLayer, RateLimitHandle)>,
 }
 
 impl std::fmt::Debug for MiddlewareConfig {
@@ -148,22 +154,34 @@ pub type MiddlewareStack = tower::layer::util::Stack<
 
 /// Build the standard switchboard-server Tower middleware stack.
 ///
-/// Returns a [`ServiceBuilder`] with the following layers applied (outermost
-/// first, i.e. the order in which a request passes through):
-///
-/// 1. `RequestIdLayer` — assign / propagate request ID
-/// 2. `ModelOverrideLayer` — resolve model and provider
-/// 3. `AuthLayer` — validate client credentials
-/// 4. `RateLimitLayer` — enforce per-user rate limits
-/// 5. `AuthInjectLayer` — select upstream key
+/// Returns `(stack, handle)` where:
+/// - `stack` is a [`ServiceBuilder`] with the following layers applied
+///   (outermost first, i.e. the order in which a request passes through):
+///   1. `RequestIdLayer` — assign / propagate request ID
+///   2. `ModelOverrideLayer` — resolve model and provider
+///   3. `AuthLayer` — validate client credentials
+///   4. `RateLimitLayer` — enforce per-user rate limits
+///   5. `AuthInjectLayer` — select upstream key
+/// - `handle` is a [`RateLimitHandle`] that allows live updates to rate-limit
+///   overrides without restarting.  Pass it to [`crate::admin::AdminState`] so
+///   the admin API can mutate it at runtime.
 ///
 /// If `cfg.guardrail_pipeline` is `Some`, the caller should wrap the axum
 /// `Router` with [`GuardrailLayer`] directly (see `main.rs`).
-pub fn build_middleware_stack(cfg: MiddlewareConfig) -> ServiceBuilder<MiddlewareStack> {
+pub fn build_middleware_stack(
+    cfg: MiddlewareConfig,
+) -> (ServiceBuilder<MiddlewareStack>, RateLimitHandle) {
     // guardrail_pipeline is consumed by the caller — it is available in cfg so
     // the main server can extract it and apply GuardrailLayer on the router.
     let _ = cfg.guardrail_pipeline;
-    ServiceBuilder::new()
+
+    // Use a pre-built layer+handle when provided (allows sharing the handle
+    // with the admin server); otherwise construct from the config fields.
+    let (rate_limit_layer, handle) = cfg.rate_limit_layer.unwrap_or_else(|| {
+        RateLimitLayer::new(cfg.default_rpm, cfg.default_tpm, cfg.rate_limit_overrides)
+    });
+
+    let stack = ServiceBuilder::new()
         .layer(RequestIdLayer)
         .layer(ModelOverrideLayer::new(
             cfg.model_selector,
@@ -171,12 +189,9 @@ pub fn build_middleware_stack(cfg: MiddlewareConfig) -> ServiceBuilder<Middlewar
             cfg.providers_config,
         ))
         .layer(AuthLayer::new(cfg.auth_registry))
-        .layer(RateLimitLayer::new(
-            cfg.default_rpm,
-            cfg.default_tpm,
-            cfg.rate_limit_overrides,
-        ))
-        .layer(AuthInjectLayer::new(cfg.key_pools))
+        .layer(rate_limit_layer)
+        .layer(AuthInjectLayer::new(cfg.key_pools));
+    (stack, handle)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -203,6 +218,7 @@ mod tests {
             provider_registry: Arc::new(ProviderRegistry::new()),
             providers_config: Arc::new(HashMap::new()),
             guardrail_pipeline: None,
+            rate_limit_layer: None,
         }
     }
 
@@ -231,8 +247,9 @@ mod tests {
             provider_registry: Arc::new(ProviderRegistry::new()),
             providers_config: Arc::new(HashMap::new()),
             guardrail_pipeline: None,
+            rate_limit_layer: None,
         };
-        let _stack = build_middleware_stack(cfg);
+        let (_stack, _handle) = build_middleware_stack(cfg);
     }
 
     #[test]
@@ -263,6 +280,7 @@ mod tests {
             provider_registry: Arc::new(ProviderRegistry::new()),
             providers_config: Arc::new(HashMap::new()),
             guardrail_pipeline: None,
+            rate_limit_layer: None,
         };
         assert_eq!(cfg.default_rpm, 10);
         assert_eq!(cfg.rate_limit_overrides.len(), 1);

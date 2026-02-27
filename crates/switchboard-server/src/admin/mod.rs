@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 use crate::config::HotConfig;
 use crate::error::ServerError;
 use crate::key_pool::KeyPool;
+use crate::middleware::RateLimitHandle;
 
 pub use auth::AdminAuthState;
 
@@ -22,7 +23,8 @@ pub use auth::AdminAuthState;
 /// Shared state for the admin server.
 ///
 /// Holds references to the hot-reloadable config, the key pools (wrapped in
-/// `RwLock` so the admin API can mutate them at runtime), and the auth state.
+/// `RwLock` so the admin API can mutate them at runtime), the auth state, and
+/// the live rate-limit handle for instant override updates.
 pub struct AdminState {
     /// Hot-reloadable server configuration.
     pub hot_config: Arc<HotConfig>,
@@ -33,6 +35,10 @@ pub struct AdminState {
 
     /// Admin authentication state (static token or JWT config).
     pub auth_state: Arc<AdminAuthState>,
+
+    /// Handle to the live rate-limit override table.  Updates here take effect
+    /// immediately without restarting the server.
+    pub rate_limit_handle: RateLimitHandle,
 }
 
 impl AdminState {
@@ -41,11 +47,13 @@ impl AdminState {
         hot_config: Arc<HotConfig>,
         key_pools: Arc<HashMap<String, Arc<RwLock<KeyPool>>>>,
         auth_state: Arc<AdminAuthState>,
+        rate_limit_handle: RateLimitHandle,
     ) -> Self {
         Self {
             hot_config,
             key_pools,
             auth_state,
+            rate_limit_handle,
         }
     }
 }
@@ -115,6 +123,7 @@ mod tests {
     use crate::admin::AdminAuthState;
     use crate::config::{AdminConfig, HotConfig, ServerConfig};
     use crate::key_pool::{KeyPool, WeightedRandomSelector};
+    use crate::middleware::RateLimitLayer;
 
     fn make_hot_config() -> Arc<HotConfig> {
         let cfg = ServerConfig::default();
@@ -132,7 +141,8 @@ mod tests {
             ..AdminConfig::default()
         };
         let auth_state = Arc::new(AdminAuthState::new(admin_config));
-        Arc::new(AdminState::new(hot_config, pools, auth_state))
+        let (_layer, handle) = RateLimitLayer::new(60, 100_000, std::iter::empty());
+        Arc::new(AdminState::new(hot_config, pools, auth_state, handle))
     }
 
     fn build_router(state: Arc<AdminState>) -> axum::Router {
@@ -261,7 +271,13 @@ mod tests {
             ..AdminConfig::default()
         };
         let auth_state = Arc::new(AdminAuthState::new(admin_config));
-        let state = Arc::new(AdminState::new(hot_config, Arc::new(pools), auth_state));
+        let (_layer, handle) = RateLimitLayer::new(60, 100_000, std::iter::empty());
+        let state = Arc::new(AdminState::new(
+            hot_config,
+            Arc::new(pools),
+            auth_state,
+            handle,
+        ));
         let app = build_router(state);
 
         let req = Request::builder()
@@ -420,10 +436,12 @@ mod tests {
             ..AdminConfig::default()
         };
         let auth_state = Arc::new(AdminAuthState::new(admin_config));
+        let (_layer, handle) = RateLimitLayer::new(60, 100_000, std::iter::empty());
         let state = Arc::new(AdminState::new(
             hot_config,
             Arc::new(HashMap::new()),
             auth_state,
+            handle,
         ));
         let app = build_router(state);
 
