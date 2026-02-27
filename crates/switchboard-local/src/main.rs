@@ -4,7 +4,7 @@
 //! - `init`   — interactive setup wizard
 //! - `start`  — start the proxy in the foreground
 //! - `status` — print connectivity and configuration status
-//! - `stop`   — (not implemented) show instructions to kill the process
+//! - `stop`   — send SIGTERM to the running proxy via PID file
 
 use std::sync::Arc;
 
@@ -40,7 +40,7 @@ enum Commands {
     Start,
     /// Show current status and connectivity
     Status,
-    /// Stop the running proxy (not implemented — kill the process)
+    /// Stop the running proxy via PID file (sends SIGTERM)
     Stop,
 }
 
@@ -54,10 +54,29 @@ async fn main() -> Result<()> {
         Commands::Init => cmd_init().await?,
         Commands::Start => cmd_start().await?,
         Commands::Status => cmd_status().await?,
-        Commands::Stop => cmd_stop(),
+        Commands::Stop => cmd_stop().await?,
     }
 
     Ok(())
+}
+
+// ── PID file helpers ──────────────────────────────────────────────────────────
+
+/// Returns the path to the PID file: `~/.switchboard/switchboard-local.pid`.
+pub(crate) fn pid_file_path() -> std::path::PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    home.join(".switchboard").join("switchboard-local.pid")
+}
+
+/// RAII guard that removes the PID file when dropped (best-effort).
+pub(crate) struct PidGuard(pub std::path::PathBuf);
+
+impl Drop for PidGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 // ── `init` ────────────────────────────────────────────────────────────────────
@@ -191,6 +210,29 @@ async fn cmd_init() -> Result<(), LocalError> {
     println!("Config written to {}", config_path.display());
     println!("Run `switchboard-local start` to start the proxy.");
 
+    // Probe the server URL to verify connectivity.
+    println!();
+    println!("Testing connectivity to {} ...", cfg.server.url);
+
+    let test_url = format!("{}/health", cfg.server.url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| LocalError::Config(format!("failed to build HTTP client: {e}")))?;
+
+    match client.get(&test_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            println!("✓ Server reachable ({})", resp.status());
+        }
+        Ok(resp) => {
+            println!("⚠ Server returned {} — check configuration.", resp.status());
+        }
+        Err(e) => {
+            println!("⚠ Could not reach server: {e}");
+            println!("  Config saved anyway. You can retry with `switchboard-local status`.");
+        }
+    }
+
     Ok(())
 }
 
@@ -206,6 +248,21 @@ async fn cmd_start() -> Result<(), LocalError> {
         auth = %config.auth.method,
         "switchboard-local starting"
     );
+
+    // Write PID file.
+    let pid_path = pid_file_path();
+    let pid = std::process::id();
+    std::fs::write(&pid_path, pid.to_string()).map_err(|e| {
+        LocalError::Config(format!(
+            "failed to write PID file {}: {e}",
+            pid_path.display()
+        ))
+    })?;
+    tracing::info!(pid = pid, path = %pid_path.display(), "PID file written");
+
+    // Remove PID file on exit (best-effort).
+    let pid_path_clone = pid_path.clone();
+    let _pid_guard = PidGuard(pid_path_clone);
 
     let server = LocalServer::new(Arc::new(config)).await?;
     server.run().await
@@ -270,11 +327,100 @@ async fn cmd_status() -> Result<(), LocalError> {
 
 // ── `stop` ────────────────────────────────────────────────────────────────────
 
-fn cmd_stop() {
-    println!(
-        "switchboard-local does not support a stop command.\n\
-         To stop the proxy, find the process and kill it:\n\
-         \n    pkill switchboard-local\n\
-         \nor find the PID with `pgrep switchboard-local` and use `kill <pid>`."
-    );
+async fn cmd_stop() -> Result<(), LocalError> {
+    let pid_path = pid_file_path();
+
+    if !pid_path.exists() {
+        println!("No PID file found at {}.", pid_path.display());
+        println!("switchboard-local may not be running, or was started without this version.");
+        println!("To stop manually: pkill switchboard-local");
+        return Ok(());
+    }
+
+    let pid_str = std::fs::read_to_string(&pid_path)
+        .map_err(|e| LocalError::Config(format!("failed to read PID file: {e}")))?;
+    let pid: u32 = pid_str
+        .trim()
+        .parse()
+        .map_err(|_| LocalError::Config(format!("invalid PID in file: '{}'", pid_str.trim())))?;
+
+    #[cfg(unix)]
+    {
+        // Send SIGTERM to the process.
+        let result = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+        if result == 0 {
+            println!("Sent SIGTERM to switchboard-local (PID {pid}).");
+            // Give it 2 seconds then check if still running.
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            let still_running = unsafe { libc::kill(pid as libc::pid_t, 0) } == 0;
+            if still_running {
+                println!("Process still running after 2s. Send SIGKILL? (run: kill -9 {pid})");
+            } else {
+                println!("Process stopped.");
+                let _ = std::fs::remove_file(&pid_path);
+            }
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::PermissionDenied {
+                return Err(LocalError::Config(format!(
+                    "permission denied sending signal to PID {pid}"
+                )));
+            }
+            // ESRCH — no such process: stale PID file
+            println!("Process {pid} not found (stale PID file). Cleaning up.");
+            let _ = std::fs::remove_file(&pid_path);
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        println!("Stop via PID file is only supported on Unix. To stop: kill {pid}");
+    }
+
+    Ok(())
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pid_file_path_under_home() {
+        let path = pid_file_path();
+        let path_str = path.to_string_lossy();
+        assert!(
+            path_str.ends_with(".switchboard/switchboard-local.pid"),
+            "expected path ending with .switchboard/switchboard-local.pid, got: {path_str}"
+        );
+    }
+
+    #[test]
+    fn test_pid_guard_removes_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.pid");
+        std::fs::write(&file_path, "12345").unwrap();
+        assert!(file_path.exists(), "file should exist before drop");
+        {
+            let _guard = PidGuard(file_path.clone());
+        }
+        assert!(
+            !file_path.exists(),
+            "file should be removed after PidGuard is dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cmd_stop_no_pid_file() {
+        // Override HOME to a temp dir where no PID file exists.
+        let dir = tempfile::tempdir().unwrap();
+        // Safety: single-threaded test, no concurrent env reads.
+        unsafe { std::env::set_var("HOME", dir.path()) };
+        let result = cmd_stop().await;
+        assert!(
+            result.is_ok(),
+            "cmd_stop should return Ok when no PID file exists"
+        );
+    }
 }
