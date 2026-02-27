@@ -102,7 +102,13 @@ async fn main() -> Result<()> {
 
     // Spawn the admin server if enabled.
     if app_state.config.admin.enabled {
-        let admin_auth_state = Arc::new(AdminAuthState::new(app_state.config.admin.clone()));
+        let mut admin_auth_state_inner = AdminAuthState::new(app_state.config.admin.clone());
+        if app_state.config.admin.auth == "jwt" {
+            if let Err(e) = admin_auth_state_inner.init_jwt().await {
+                tracing::warn!(error = %e, "admin JWT init failed, continuing without JWT auth");
+            }
+        }
+        let admin_auth_state = Arc::new(admin_auth_state_inner);
 
         // Build admin-writable key pools (RwLock-wrapped for admin mutations).
         // One empty pool per provider is created; the admin API populates them
