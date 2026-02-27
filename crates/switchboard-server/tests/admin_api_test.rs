@@ -14,6 +14,7 @@ use switchboard_server::admin::{AdminAuthState, AdminState, admin_router};
 use switchboard_server::config::provider::{KeyEntry, KeyPoolConfig, ProviderConfig};
 use switchboard_server::config::{AdminConfig, HotConfig, ServerConfig};
 use switchboard_server::key_pool::{KeyPool, WeightedRandomSelector};
+use switchboard_server::middleware::RateLimitLayer;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -70,11 +71,13 @@ fn make_admin_state_with_config(hot_config: Arc<HotConfig>, token: &str) -> Arc<
         ..AdminConfig::default()
     };
     let auth_state = Arc::new(AdminAuthState::new(admin_config));
+    let (_layer, handle) = RateLimitLayer::new(60, 100_000, std::iter::empty());
     Arc::new(AdminState::new(
         hot_config,
         pools,
         auth_state,
         Arc::new(switchboard_server::observability::UsageTracker::new()),
+        handle,
     ))
 }
 
@@ -93,11 +96,13 @@ fn make_admin_state_with_pool(token: &str) -> Arc<AdminState> {
         ..AdminConfig::default()
     };
     let auth_state = Arc::new(AdminAuthState::new(admin_config));
+    let (_layer, handle) = RateLimitLayer::new(60, 100_000, std::iter::empty());
     Arc::new(AdminState::new(
         hot_config,
         Arc::new(pools),
         auth_state,
         Arc::new(switchboard_server::observability::UsageTracker::new()),
+        handle,
     ))
 }
 
@@ -129,11 +134,13 @@ async fn test_admin_server_starts_when_enabled() {
 
     let auth_state = Arc::new(AdminAuthState::new(admin_config));
     let hot_config = Arc::new(HotConfig::new(server_config, "/nonexistent/config.toml"));
+    let (_layer, handle) = RateLimitLayer::new(60, 100_000, std::iter::empty());
     let state = Arc::new(AdminState::new(
         hot_config,
         Arc::new(HashMap::new()),
         auth_state,
         Arc::new(switchboard_server::observability::UsageTracker::new()),
+        handle,
     ));
 
     // serve_admin with port 0 should bind successfully.
@@ -352,11 +359,13 @@ async fn test_admin_get_config_redacts_secrets() {
         ..AdminConfig::default()
     };
     let auth_state = Arc::new(AdminAuthState::new(admin_config));
+    let (_layer, handle) = RateLimitLayer::new(60, 100_000, std::iter::empty());
     let state = Arc::new(AdminState::new(
         hot_config,
         Arc::new(HashMap::new()),
         auth_state,
         Arc::new(switchboard_server::observability::UsageTracker::new()),
+        handle,
     ));
     let app = admin_router(state);
 

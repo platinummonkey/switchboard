@@ -33,12 +33,43 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tower::{Layer, Service};
 
+use serde::{Deserialize, Serialize};
+
 use crate::auth::validator::ValidatedClient;
+
+// ── RateLimitHandle ───────────────────────────────────────────────────────────
+
+/// A handle to the live rate-limit override table.
+/// Cloning this handle gives a reference to the same underlying map.
+#[derive(Debug, Clone)]
+pub struct RateLimitHandle {
+    overrides: Arc<DashMap<String, RateLimitSettings>>,
+}
+
+impl RateLimitHandle {
+    /// Set or update the rate limit for a specific user/team ID.
+    pub fn set_override(&self, id: impl Into<String>, settings: RateLimitSettings) {
+        self.overrides.insert(id.into(), settings);
+    }
+
+    /// Remove an override, reverting to the global default.
+    pub fn remove_override(&self, id: &str) {
+        self.overrides.remove(id);
+    }
+
+    /// Return a snapshot of all current overrides.
+    pub fn snapshot(&self) -> Vec<(String, RateLimitSettings)> {
+        self.overrides
+            .iter()
+            .map(|r| (r.key().clone(), *r.value()))
+            .collect()
+    }
+}
 
 // ── Rate limit config snapshot ────────────────────────────────────────────────
 
 /// A snapshot of rate limit settings for a single user/entity.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RateLimitSettings {
     /// Max requests per minute.
     pub rpm: u32,
@@ -89,28 +120,35 @@ pub struct RateLimitLayer {
 }
 
 impl RateLimitLayer {
-    /// Create a new layer.
+    /// Create a new layer and its associated [`RateLimitHandle`].
+    ///
+    /// Returns a `(layer, handle)` tuple so callers can update overrides at
+    /// runtime without restarting. Both the layer and handle share the same
+    /// underlying `Arc<DashMap>`, so changes via the handle are immediately
+    /// visible to in-flight requests.
     ///
     /// - `default_rpm`: Requests per minute for users without an override.
     /// - `default_tpm`: Tokens per minute for users without an override.
-    /// - `overrides`: Per-user settings keyed by user identifier string.
+    /// - `overrides`: Initial per-user settings keyed by user identifier string.
     pub fn new(
         default_rpm: u32,
         default_tpm: u32,
         overrides: impl IntoIterator<Item = (String, RateLimitSettings)>,
-    ) -> Self {
-        let overrides_map = DashMap::new();
-        for (k, v) in overrides {
-            overrides_map.insert(k, v);
-        }
-        Self {
+    ) -> (Self, RateLimitHandle) {
+        let overrides_map: Arc<DashMap<String, RateLimitSettings>> =
+            Arc::new(overrides.into_iter().collect());
+        let handle = RateLimitHandle {
+            overrides: Arc::clone(&overrides_map),
+        };
+        let layer = Self {
             inner: Arc::new(RateLimitState {
                 default_rpm,
                 default_tpm,
                 overrides: overrides_map,
                 buckets: DashMap::new(),
             }),
-        }
+        };
+        (layer, handle)
     }
 }
 
@@ -131,7 +169,8 @@ impl<S> Layer<S> for RateLimitLayer {
 struct RateLimitState {
     default_rpm: u32,
     default_tpm: u32,
-    overrides: DashMap<String, RateLimitSettings>,
+    /// Shared with [`RateLimitHandle`] via `Arc` so live updates are visible.
+    overrides: Arc<DashMap<String, RateLimitSettings>>,
     buckets: DashMap<String, BucketState>,
 }
 
@@ -345,7 +384,8 @@ mod tests {
     }
 
     fn make_layer(rpm: u32, tpm: u32) -> RateLimitLayer {
-        RateLimitLayer::new(rpm, tpm, std::iter::empty())
+        let (layer, _handle) = RateLimitLayer::new(rpm, tpm, std::iter::empty());
+        layer
     }
 
     fn req_with_user(user_id: &str) -> Request<Body> {
@@ -430,7 +470,7 @@ mod tests {
                 tpm: 1_000_000,
             },
         )];
-        let layer = RateLimitLayer::new(2, 100_000, overrides);
+        let (layer, _handle) = RateLimitLayer::new(2, 100_000, overrides);
         let mut svc = layer.layer(OkSvc);
 
         // power-user can make 5 requests without hitting the default limit of 2.
@@ -461,7 +501,7 @@ mod tests {
         let state = RateLimitState {
             default_rpm: 60,
             default_tpm: 100_000,
-            overrides: DashMap::new(),
+            overrides: Arc::new(DashMap::new()),
             buckets: DashMap::new(),
         };
         let settings = state.settings_for("unknown-user");
@@ -474,7 +514,7 @@ mod tests {
         let state = RateLimitState {
             default_rpm: 60,
             default_tpm: 100_000,
-            overrides: DashMap::new(),
+            overrides: Arc::new(DashMap::new()),
             buckets: DashMap::new(),
         };
         state.overrides.insert(
@@ -494,7 +534,7 @@ mod tests {
         let state = Arc::new(RateLimitState {
             default_rpm: 100,
             default_tpm: 1000,
-            overrides: DashMap::new(),
+            overrides: Arc::new(DashMap::new()),
             buckets: DashMap::new(),
         });
         // Prime the bucket.
@@ -522,5 +562,68 @@ mod tests {
 
         let r3 = RateLimitReason::Anonymous;
         assert!(r3.to_string().contains("anonymous"));
+    }
+
+    // ── RateLimitHandle tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_rate_limit_handle_set_override() {
+        let (_layer, handle) = RateLimitLayer::new(10, 100_000, std::iter::empty());
+        handle.set_override(
+            "alice",
+            RateLimitSettings {
+                rpm: 999,
+                tpm: 5_000_000,
+            },
+        );
+        let snap = handle.snapshot();
+        assert_eq!(snap.len(), 1);
+        let (id, settings) = &snap[0];
+        assert_eq!(id, "alice");
+        assert_eq!(settings.rpm, 999);
+        assert_eq!(settings.tpm, 5_000_000);
+    }
+
+    #[test]
+    fn test_rate_limit_handle_remove_override() {
+        let (_layer, handle) = RateLimitLayer::new(10, 100_000, std::iter::empty());
+        handle.set_override(
+            "bob",
+            RateLimitSettings {
+                rpm: 50,
+                tpm: 50_000,
+            },
+        );
+        assert_eq!(handle.snapshot().len(), 1);
+        handle.remove_override("bob");
+        assert!(handle.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_rate_limit_handle_live_update_affects_service() {
+        // Start with a very low rpm of 1 so the second request would normally
+        // be rate-limited. Then raise the limit via the handle and verify the
+        // service allows more requests.
+        let (layer, handle) = RateLimitLayer::new(1, 100_000, std::iter::empty());
+        let mut svc = layer.layer(OkSvc);
+
+        // First request allowed (uses up the 1 rpm default slot for "carol").
+        svc.ready().await.unwrap();
+        let resp = svc.call(req_with_user("carol")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Second request would be blocked — but raise the limit first.
+        handle.set_override(
+            "carol",
+            RateLimitSettings {
+                rpm: 1_000,
+                tpm: 10_000_000,
+            },
+        );
+
+        // Now carol has a 1000 rpm override, so the second request passes.
+        svc.ready().await.unwrap();
+        let resp = svc.call(req_with_user("carol")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

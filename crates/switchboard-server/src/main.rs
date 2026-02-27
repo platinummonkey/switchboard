@@ -24,7 +24,7 @@ use switchboard_server::key_pool::{
     RoundRobinSelector, WeightedRandomSelector,
 };
 use switchboard_server::middleware::{
-    GuardrailLayer, MiddlewareConfig, RateLimitSettings, build_middleware_stack,
+    GuardrailLayer, MiddlewareConfig, RateLimitLayer, RateLimitSettings, build_middleware_stack,
 };
 use switchboard_server::observability::{self, UsageTracker};
 use switchboard_server::providers::{
@@ -98,6 +98,12 @@ async fn main() -> Result<()> {
     // (written by proxy handlers) and AdminState (read by admin API).
     let usage = Arc::new(UsageTracker::new());
 
+    // Pre-build the rate limit layer and handle so the handle can be shared
+    // with the admin server.  Both reference the same underlying DashMap, so
+    // changes via the handle are immediately visible to in-flight requests.
+    let (rate_limit_layer, rate_limit_handle) =
+        RateLimitLayer::new(default_rpm, default_tpm, rate_limit_overrides);
+
     let app_state = Arc::new(AppState {
         config: Arc::new(server_config),
         providers: Arc::new(provider_registry),
@@ -136,6 +142,7 @@ async fn main() -> Result<()> {
             Arc::new(admin_pools),
             admin_auth_state,
             Arc::clone(&usage),
+            rate_limit_handle.clone(),
         ));
 
         let admin_listen = app_state.config.admin.listen.clone();
@@ -168,15 +175,18 @@ async fn main() -> Result<()> {
         auth_registry: Arc::new(auth_registry),
         default_rpm,
         default_tpm,
-        rate_limit_overrides,
+        rate_limit_overrides: vec![],
         key_pools: Arc::clone(&app_state.key_pools),
         model_selector,
         provider_registry: Arc::clone(&app_state.providers),
         providers_config,
         guardrail_pipeline: guardrail_pipeline.clone(),
+        // Supply the pre-built layer so the admin server's handle shares the
+        // same underlying DashMap.
+        rate_limit_layer: Some((rate_limit_layer, rate_limit_handle.clone())),
     };
 
-    let stack = build_middleware_stack(middleware_cfg);
+    let (stack, _stack_handle) = build_middleware_stack(middleware_cfg);
 
     let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))

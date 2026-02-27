@@ -8,14 +8,16 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 
 use crate::admin::AdminState;
 use crate::admin::auth::AdminAuth;
 use crate::config::provider::KeyEntry;
+use crate::config::rate_limit::RateLimitOverride;
 use crate::config::{GuardrailsConfig, ModelSelectionConfig, RateLimitConfig, RoutingConfig};
+use crate::middleware::RateLimitSettings;
 
 // ── Provider / Key Pool response types ───────────────────────────────────────
 
@@ -587,6 +589,77 @@ pub async fn put_rate_limits(
     )
 }
 
+/// `PUT /admin/api/v1/rate-limits/overrides/{id}` — set a live override.
+///
+/// Updates the live [`RateLimitHandle`] immediately so the change takes effect
+/// for subsequent requests without a server restart.  Also persists the change
+/// to [`HotConfig`] so it survives config reloads.
+pub async fn set_rate_limit_override(
+    State(state): State<Arc<AdminState>>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+    Json(settings): Json<RateLimitSettings>,
+) -> impl IntoResponse {
+    // 1. Update the live handle immediately.
+    state.rate_limit_handle.set_override(id.clone(), settings);
+    // 2. Persist to HotConfig so it survives config reload.
+    state.hot_config.update(|cfg| {
+        cfg.rate_limit.overrides.insert(
+            id.clone(),
+            RateLimitOverride {
+                rpm: Some(settings.rpm),
+                tpm: Some(settings.tpm),
+            },
+        );
+    });
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "updated", "id": id})),
+    )
+}
+
+/// `DELETE /admin/api/v1/rate-limits/overrides/{id}` — remove a live override.
+///
+/// Reverts the user/team identified by `id` to the global default.  Also
+/// removes the entry from [`HotConfig`].
+pub async fn delete_rate_limit_override(
+    State(state): State<Arc<AdminState>>,
+    _auth: AdminAuth,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    state.rate_limit_handle.remove_override(&id);
+    state.hot_config.update(|cfg| {
+        cfg.rate_limit.overrides.remove(&id);
+    });
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"status": "deleted", "id": id})),
+    )
+}
+
+/// `GET /admin/api/v1/rate-limits/overrides` — list all live overrides.
+pub async fn list_rate_limit_overrides(
+    State(state): State<Arc<AdminState>>,
+    _auth: AdminAuth,
+) -> impl IntoResponse {
+    let overrides: Vec<serde_json::Value> = state
+        .rate_limit_handle
+        .snapshot()
+        .into_iter()
+        .map(|(id, s)| {
+            serde_json::json!({
+                "id": id,
+                "rpm": s.rpm,
+                "tpm": s.tpm,
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({"overrides": overrides})),
+    )
+}
+
 // ── System handlers ───────────────────────────────────────────────────────────
 
 /// `GET /admin/api/v1/health` — system health (no auth required).
@@ -743,6 +816,14 @@ pub fn admin_api_router(state: Arc<AdminState>) -> Router {
             "/admin/api/v1/rate-limits",
             get(get_rate_limits).put(put_rate_limits),
         )
+        .route(
+            "/admin/api/v1/rate-limits/overrides",
+            get(list_rate_limit_overrides),
+        )
+        .route(
+            "/admin/api/v1/rate-limits/overrides/{id}",
+            put(set_rate_limit_override).delete(delete_rate_limit_override),
+        )
         // System.
         .route("/admin/api/v1/config/reload", post(reload_config))
         .route("/admin/api/v1/config", get(get_config))
@@ -830,5 +911,163 @@ mod tests {
         redact_secrets(&mut val);
         // Empty string — not redacted.
         assert_eq!(val["admin"]["static_token"], "");
+    }
+
+    // ── Rate-limit override endpoint tests ────────────────────────────────────
+
+    fn make_admin_state_for_rate_limit_tests(token: &str) -> std::sync::Arc<AdminState> {
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        use crate::admin::auth::AdminAuthState;
+        use crate::config::{AdminConfig, HotConfig, ServerConfig};
+        use crate::middleware::RateLimitLayer;
+
+        let hot_config = Arc::new(HotConfig::new(
+            ServerConfig::default(),
+            "/tmp/nonexistent-rl-test.toml",
+        ));
+        let pools = Arc::new(HashMap::new());
+        let admin_config = AdminConfig {
+            enabled: true,
+            auth: "static_token".into(),
+            static_token: Some(token.into()),
+            ..AdminConfig::default()
+        };
+        let auth_state = Arc::new(AdminAuthState::new(admin_config));
+        let (_layer, handle) = RateLimitLayer::new(60, 100_000, std::iter::empty());
+        Arc::new(AdminState::new(
+            hot_config,
+            pools,
+            auth_state,
+            Arc::new(crate::observability::UsageTracker::new()),
+            handle,
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_set_rate_limit_override_endpoint() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        use crate::admin::admin_router;
+
+        let state = make_admin_state_for_rate_limit_tests("tok");
+        let app = admin_router(std::sync::Arc::clone(&state));
+
+        let body = serde_json::json!({"rpm": 500, "tpm": 2_000_000});
+        let req = Request::builder()
+            .method("PUT")
+            .uri("/admin/api/v1/rate-limits/overrides/alice")
+            .header("Authorization", "Bearer tok")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["status"], "updated");
+        assert_eq!(json["id"], "alice");
+
+        // Verify the live handle was updated.
+        let snap = state.rate_limit_handle.snapshot();
+        assert_eq!(snap.len(), 1);
+        let (id, settings) = &snap[0];
+        assert_eq!(id, "alice");
+        assert_eq!(settings.rpm, 500);
+        assert_eq!(settings.tpm, 2_000_000);
+    }
+
+    #[tokio::test]
+    async fn test_delete_rate_limit_override_endpoint() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        use crate::admin::admin_router;
+
+        let state = make_admin_state_for_rate_limit_tests("tok");
+        // Pre-populate via handle.
+        state.rate_limit_handle.set_override(
+            "bob",
+            crate::middleware::RateLimitSettings {
+                rpm: 10,
+                tpm: 10_000,
+            },
+        );
+        assert_eq!(state.rate_limit_handle.snapshot().len(), 1);
+
+        let app = admin_router(std::sync::Arc::clone(&state));
+
+        let req = Request::builder()
+            .method("DELETE")
+            .uri("/admin/api/v1/rate-limits/overrides/bob")
+            .header("Authorization", "Bearer tok")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(json["status"], "deleted");
+        assert_eq!(json["id"], "bob");
+
+        // Verify the override is gone.
+        assert!(state.rate_limit_handle.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_rate_limit_overrides_endpoint() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
+        use crate::admin::admin_router;
+
+        let state = make_admin_state_for_rate_limit_tests("tok");
+        // Pre-populate two overrides via handle.
+        state.rate_limit_handle.set_override(
+            "carol",
+            crate::middleware::RateLimitSettings {
+                rpm: 200,
+                tpm: 500_000,
+            },
+        );
+        state.rate_limit_handle.set_override(
+            "dave",
+            crate::middleware::RateLimitSettings {
+                rpm: 50,
+                tpm: 50_000,
+            },
+        );
+
+        let app = admin_router(std::sync::Arc::clone(&state));
+
+        let req = Request::builder()
+            .uri("/admin/api/v1/rate-limits/overrides")
+            .header("Authorization", "Bearer tok")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let overrides = json["overrides"].as_array().unwrap();
+        assert_eq!(overrides.len(), 2);
+        // Both carol and dave should appear.
+        let ids: std::collections::HashSet<&str> = overrides
+            .iter()
+            .map(|v| v["id"].as_str().unwrap())
+            .collect();
+        assert!(ids.contains("carol"));
+        assert!(ids.contains("dave"));
     }
 }
