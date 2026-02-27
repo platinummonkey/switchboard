@@ -100,7 +100,12 @@ toml = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
 rust-embed = { workspace = true }
 criterion = { version = "0.5", features = ["async_tokio"] }
+libc = { workspace = true }
 
 [[bench]]
 name = "proxy_bench"
+harness = false
+
+[[bench]]
+name = "memory_bench"
 harness = false
