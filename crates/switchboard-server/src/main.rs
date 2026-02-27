@@ -418,6 +418,54 @@ async fn build_providers(
                         }
                     }
                 }
+                "vault" => {
+                    let vault_addr = std::env::var("VAULT_ADDR")
+                        .unwrap_or_else(|_| "http://127.0.0.1:8200".to_string());
+                    let vault_token = std::env::var("VAULT_TOKEN").unwrap_or_default();
+                    let path = entry.vault_path.as_deref().unwrap_or("");
+
+                    let provider = switchboard_server::key_pool::VaultProvider::new(
+                        path,
+                        &vault_addr,
+                        &vault_token,
+                    );
+                    match provider.fetch().await {
+                        Ok(creds) => {
+                            let expires_at = creds.expires_at;
+                            if let Some(exp) = expires_at {
+                                tracing::info!(
+                                    key_id = %entry.id,
+                                    vault_path = path,
+                                    expires_in_secs = exp.duration_since(std::time::Instant::now()).as_secs(),
+                                    "fetched initial Vault credentials with TTL"
+                                );
+                            } else {
+                                tracing::info!(
+                                    key_id = %entry.id,
+                                    vault_path = path,
+                                    "fetched initial Vault credentials (no TTL)"
+                                );
+                            }
+                            keys.push(PooledKey {
+                                id: entry.id.clone(),
+                                credentials: creds,
+                                weight: entry.weight,
+                                source: switchboard_server::key_pool::KeySource::Vault {
+                                    path: path.to_string(),
+                                },
+                                health: switchboard_server::key_pool::KeyHealth::default(),
+                            });
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                key_id = %entry.id,
+                                vault_path = path,
+                                error = %e,
+                                "failed to fetch initial Vault credentials, skipping key"
+                            );
+                        }
+                    }
+                }
                 other => {
                     tracing::warn!(
                         key_id = %entry.id,
