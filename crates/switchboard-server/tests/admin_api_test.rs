@@ -70,7 +70,12 @@ fn make_admin_state_with_config(hot_config: Arc<HotConfig>, token: &str) -> Arc<
         ..AdminConfig::default()
     };
     let auth_state = Arc::new(AdminAuthState::new(admin_config));
-    Arc::new(AdminState::new(hot_config, pools, auth_state))
+    Arc::new(AdminState::new(
+        hot_config,
+        pools,
+        auth_state,
+        Arc::new(switchboard_server::observability::UsageTracker::new()),
+    ))
 }
 
 fn make_admin_state_with_pool(token: &str) -> Arc<AdminState> {
@@ -88,7 +93,12 @@ fn make_admin_state_with_pool(token: &str) -> Arc<AdminState> {
         ..AdminConfig::default()
     };
     let auth_state = Arc::new(AdminAuthState::new(admin_config));
-    Arc::new(AdminState::new(hot_config, Arc::new(pools), auth_state))
+    Arc::new(AdminState::new(
+        hot_config,
+        Arc::new(pools),
+        auth_state,
+        Arc::new(switchboard_server::observability::UsageTracker::new()),
+    ))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -123,6 +133,7 @@ async fn test_admin_server_starts_when_enabled() {
         hot_config,
         Arc::new(HashMap::new()),
         auth_state,
+        Arc::new(switchboard_server::observability::UsageTracker::new()),
     ));
 
     // serve_admin with port 0 should bind successfully.
@@ -345,6 +356,7 @@ async fn test_admin_get_config_redacts_secrets() {
         hot_config,
         Arc::new(HashMap::new()),
         auth_state,
+        Arc::new(switchboard_server::observability::UsageTracker::new()),
     ));
     let app = admin_router(state);
 

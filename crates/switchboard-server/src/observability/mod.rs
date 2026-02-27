@@ -19,8 +19,10 @@
 pub mod dd_llm_obs;
 pub mod metrics;
 pub mod spans;
+pub mod usage;
 
 pub use spans::{ProxySpan, SpanAttributes};
+pub use usage::UsageTracker;
 
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_sdk::Resource;

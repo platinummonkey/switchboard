@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 use crate::config::HotConfig;
 use crate::error::ServerError;
 use crate::key_pool::KeyPool;
+use crate::observability::UsageTracker;
 
 pub use auth::AdminAuthState;
 
@@ -22,7 +23,8 @@ pub use auth::AdminAuthState;
 /// Shared state for the admin server.
 ///
 /// Holds references to the hot-reloadable config, the key pools (wrapped in
-/// `RwLock` so the admin API can mutate them at runtime), and the auth state.
+/// `RwLock` so the admin API can mutate them at runtime), the auth state, and
+/// the shared in-memory usage tracker.
 pub struct AdminState {
     /// Hot-reloadable server configuration.
     pub hot_config: Arc<HotConfig>,
@@ -33,6 +35,9 @@ pub struct AdminState {
 
     /// Admin authentication state (static token or JWT config).
     pub auth_state: Arc<AdminAuthState>,
+
+    /// Shared in-memory usage tracker (same instance as the proxy handler's).
+    pub usage: Arc<UsageTracker>,
 }
 
 impl AdminState {
@@ -41,11 +46,13 @@ impl AdminState {
         hot_config: Arc<HotConfig>,
         key_pools: Arc<HashMap<String, Arc<RwLock<KeyPool>>>>,
         auth_state: Arc<AdminAuthState>,
+        usage: Arc<UsageTracker>,
     ) -> Self {
         Self {
             hot_config,
             key_pools,
             auth_state,
+            usage,
         }
     }
 }
@@ -132,7 +139,12 @@ mod tests {
             ..AdminConfig::default()
         };
         let auth_state = Arc::new(AdminAuthState::new(admin_config));
-        Arc::new(AdminState::new(hot_config, pools, auth_state))
+        Arc::new(AdminState::new(
+            hot_config,
+            pools,
+            auth_state,
+            Arc::new(crate::observability::UsageTracker::new()),
+        ))
     }
 
     fn build_router(state: Arc<AdminState>) -> axum::Router {
@@ -261,7 +273,12 @@ mod tests {
             ..AdminConfig::default()
         };
         let auth_state = Arc::new(AdminAuthState::new(admin_config));
-        let state = Arc::new(AdminState::new(hot_config, Arc::new(pools), auth_state));
+        let state = Arc::new(AdminState::new(
+            hot_config,
+            Arc::new(pools),
+            auth_state,
+            Arc::new(crate::observability::UsageTracker::new()),
+        ));
         let app = build_router(state);
 
         let req = Request::builder()
@@ -424,6 +441,7 @@ mod tests {
             hot_config,
             Arc::new(HashMap::new()),
             auth_state,
+            Arc::new(crate::observability::UsageTracker::new()),
         ));
         let app = build_router(state);
 
