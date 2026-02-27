@@ -12,10 +12,12 @@ use axum::routing::{get, post};
 use http::HeaderValue;
 use tokio::signal;
 
+use switchboard_server::admin::auth::AdminAuthState;
+use switchboard_server::admin::{AdminState, serve_admin};
 use switchboard_server::auth::UpstreamCredentials;
 use switchboard_server::auth::registry::{AuthRegistry, AuthRegistryBuilder};
 use switchboard_server::auth::static_key::StaticKeyValidator;
-use switchboard_server::config::{self, ServerConfig};
+use switchboard_server::config::{self, HotConfig, ServerConfig};
 use switchboard_server::guardrails::pipeline::GuardrailPipeline;
 use switchboard_server::key_pool::{
     AwsStsProvider, KeyPool, KeyProvider, KeySelector, LeastLoadedSelector, PooledKey,
@@ -97,6 +99,41 @@ async fn main() -> Result<()> {
         providers: Arc::new(provider_registry),
         key_pools: Arc::new(key_pools),
     });
+
+    // Spawn the admin server if enabled.
+    if app_state.config.admin.enabled {
+        let admin_auth_state = Arc::new(AdminAuthState::new(app_state.config.admin.clone()));
+
+        // Build admin-writable key pools (RwLock-wrapped for admin mutations).
+        // One empty pool per provider is created; the admin API populates them
+        // at runtime. Proxy reads use the original Arc<KeyPool> independently.
+        let admin_pools: std::collections::HashMap<String, Arc<std::sync::RwLock<KeyPool>>> =
+            app_state
+                .key_pools
+                .keys()
+                .map(|k| {
+                    let pool = KeyPool::new(vec![], Box::new(WeightedRandomSelector));
+                    (k.clone(), Arc::new(std::sync::RwLock::new(pool)))
+                })
+                .collect();
+
+        let admin_state = Arc::new(AdminState::new(
+            Arc::new(HotConfig::new(
+                (*app_state.config).clone(),
+                config_path.clone(),
+            )),
+            Arc::new(admin_pools),
+            admin_auth_state,
+        ));
+
+        let admin_listen = app_state.config.admin.listen.clone();
+        tokio::spawn(async move {
+            if let Err(e) = serve_admin(admin_state, &admin_listen).await {
+                tracing::error!(error = %e, "admin server error");
+            }
+        });
+        tracing::info!(addr = %app_state.config.admin.listen, "admin server spawned");
+    }
 
     // Build guardrail pipeline from config (if enabled).
     let guardrail_pipeline = if guardrails_config.enabled {
