@@ -47,6 +47,7 @@ pub fn mock_chat_streaming(chunks: &[&str]) -> Mock {
 }
 
 /// Error response from Ollama (model not found).
+#[allow(dead_code)]
 pub fn mock_model_not_found(model: &str) -> Mock {
     Mock::given(method("POST"))
         .and(path("/v1/chat/completions"))

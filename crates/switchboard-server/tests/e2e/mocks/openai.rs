@@ -60,6 +60,7 @@ pub fn mock_chat_error(status: u16, message: &str) -> Mock {
 }
 
 /// Models list response for health checks.
+#[allow(dead_code)]
 pub fn mock_models_ok() -> Mock {
     Mock::given(method("GET"))
         .and(path("/v1/models"))

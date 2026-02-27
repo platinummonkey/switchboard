@@ -21,6 +21,7 @@ pub struct HarnessMocks {
 /// A running E2E test harness.
 pub struct TestHarness {
     /// Address of the proxy server.
+    #[allow(dead_code)]
     pub addr: SocketAddr,
     /// Address of the admin server (None if admin not enabled).
     pub admin_addr: Option<SocketAddr>,
