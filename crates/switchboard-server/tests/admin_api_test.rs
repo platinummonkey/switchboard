@@ -94,6 +94,45 @@ fn make_admin_state_with_pool(token: &str) -> Arc<AdminState> {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
+async fn test_admin_server_starts_when_enabled() {
+    // Build an AdminState with a random port and static-token auth.
+    // Verify that serve_admin binds successfully.
+    use switchboard_server::admin::serve_admin;
+
+    let admin_config = AdminConfig {
+        enabled: true,
+        auth: "static_token".into(),
+        static_token: Some("test-token".into()),
+        listen: "127.0.0.1:0".into(),
+        ..AdminConfig::default()
+    };
+
+    let server_config = ServerConfig {
+        admin: AdminConfig {
+            enabled: true,
+            auth: "static_token".into(),
+            static_token: Some("test-token".into()),
+            ..AdminConfig::default()
+        },
+        ..ServerConfig::default()
+    };
+
+    let auth_state = Arc::new(AdminAuthState::new(admin_config));
+    let hot_config = Arc::new(HotConfig::new(server_config, "/nonexistent/config.toml"));
+    let state = Arc::new(AdminState::new(
+        hot_config,
+        Arc::new(HashMap::new()),
+        auth_state,
+    ));
+
+    // serve_admin with port 0 should bind successfully.
+    // We just verify it doesn't immediately error.
+    let handle = tokio::spawn(async move { serve_admin(state, "127.0.0.1:0").await });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!handle.is_finished() || handle.await.unwrap().is_ok());
+}
+
+#[tokio::test]
 async fn test_admin_health_returns_ok() {
     let state = make_admin_state("tok");
     let app = admin_router(state);
