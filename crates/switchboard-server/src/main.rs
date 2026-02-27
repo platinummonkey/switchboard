@@ -13,10 +13,16 @@ use http::HeaderValue;
 use tokio::signal;
 
 use switchboard_server::auth::UpstreamCredentials;
+use switchboard_server::auth::registry::{AuthRegistry, AuthRegistryBuilder};
+use switchboard_server::auth::static_key::StaticKeyValidator;
 use switchboard_server::config::{self, ServerConfig};
+use switchboard_server::guardrails::pipeline::GuardrailPipeline;
 use switchboard_server::key_pool::{
     AwsStsProvider, KeyPool, KeyProvider, KeySelector, LeastLoadedSelector, PooledKey,
     RoundRobinSelector, WeightedRandomSelector,
+};
+use switchboard_server::middleware::{
+    GuardrailLayer, MiddlewareConfig, RateLimitSettings, build_middleware_stack,
 };
 use switchboard_server::observability;
 use switchboard_server::providers::{
@@ -26,6 +32,7 @@ use switchboard_server::providers::{
 use switchboard_server::proxy::handler::{
     AppState, anthropic_messages, chat_completions, health, list_models,
 };
+use switchboard_server::routing::selector::ModelSelector;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -59,6 +66,29 @@ async fn main() -> Result<()> {
     )
     .unwrap_or(std::time::Duration::from_secs(30));
 
+    // Extract sub-configs needed for middleware before server_config is
+    // moved into AppState.
+    let auth_registry = build_auth_registry(&server_config);
+    let model_selector = Arc::new(ModelSelector::new(server_config.model_selection.clone()));
+    let rate_limit_overrides: Vec<(String, RateLimitSettings)> = server_config
+        .rate_limit
+        .overrides
+        .iter()
+        .map(|(user, ov)| {
+            (
+                user.clone(),
+                RateLimitSettings {
+                    rpm: ov.rpm.unwrap_or(server_config.rate_limit.default_rpm),
+                    tpm: ov.tpm.unwrap_or(server_config.rate_limit.default_tpm),
+                },
+            )
+        })
+        .collect();
+    let default_rpm = server_config.rate_limit.default_rpm;
+    let default_tpm = server_config.rate_limit.default_tpm;
+    let providers_config = Arc::new(server_config.providers.clone());
+    let guardrails_config = server_config.guardrails.clone();
+
     // Build provider registry and key pools from config.
     let (provider_registry, key_pools) = build_providers(&server_config).await;
 
@@ -68,12 +98,53 @@ async fn main() -> Result<()> {
         key_pools: Arc::new(key_pools),
     });
 
-    let router = Router::new()
+    // Build guardrail pipeline from config (if enabled).
+    let guardrail_pipeline = if guardrails_config.enabled {
+        match GuardrailPipeline::from_config(&guardrails_config) {
+            Ok(pipeline) => {
+                tracing::info!("guardrail pipeline enabled");
+                Some(Arc::new(pipeline))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to build guardrail pipeline, continuing without guardrails");
+                None
+            }
+        }
+    } else {
+        tracing::debug!("guardrails disabled");
+        None
+    };
+
+    let middleware_cfg = MiddlewareConfig {
+        auth_registry: Arc::new(auth_registry),
+        default_rpm,
+        default_tpm,
+        rate_limit_overrides,
+        key_pools: Arc::clone(&app_state.key_pools),
+        model_selector,
+        provider_registry: Arc::clone(&app_state.providers),
+        providers_config,
+        guardrail_pipeline: guardrail_pipeline.clone(),
+    };
+
+    let stack = build_middleware_stack(middleware_cfg);
+
+    let mut router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/api/v1/messages", post(anthropic_messages))
         .route("/v1/models", get(list_models))
         .route("/health", get(health))
         .with_state(app_state);
+
+    // Apply guardrail layer closest to the handler (before middleware stack).
+    if let Some(pipeline) = guardrail_pipeline {
+        router = router.layer(GuardrailLayer::new(pipeline));
+        tracing::info!("guardrail layer applied to router");
+    }
+
+    // Apply the middleware stack (outermost layers).
+    let router = router.layer(stack);
+    tracing::info!("middleware stack applied");
 
     tracing::info!(addr = %listen_addr, "listening");
     let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
@@ -84,6 +155,38 @@ async fn main() -> Result<()> {
 
     tracing::info!("server shut down cleanly");
     Ok(())
+}
+
+/// Build an [`AuthRegistry`] from the server configuration.
+///
+/// Iterates `config.auth.validators` and registers each supported validator
+/// type.  Unknown types are logged as warnings and skipped.
+fn build_auth_registry(config: &ServerConfig) -> AuthRegistry {
+    let mut builder = AuthRegistryBuilder::default();
+
+    for (name, entry) in &config.auth.validators {
+        match entry.validator_type.as_str() {
+            "static_keys" => {
+                builder = builder.add(StaticKeyValidator::new(name, entry.keys.clone()));
+                tracing::info!(validator = name, "registered static_keys auth validator");
+            }
+            "jwt" => {
+                tracing::warn!(
+                    validator = name,
+                    "JWT validator requires runtime JWKS fetch — skipping for now"
+                );
+            }
+            other => {
+                tracing::warn!(
+                    validator = name,
+                    validator_type = other,
+                    "unsupported auth validator type, skipping"
+                );
+            }
+        }
+    }
+
+    builder.build()
 }
 
 /// Returns a future that resolves when SIGTERM or SIGINT is received,
