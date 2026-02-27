@@ -212,3 +212,309 @@ async fn test_e2e_admin_and_proxy_coexist() {
         "admin /health must still return 200 after proxy traffic"
     );
 }
+
+/// `POST /admin/api/v1/providers/openai/keys` must add a key to the pool and
+/// return 201.  A subsequent `GET /admin/api/v1/providers/openai/keys` must
+/// return a valid JSON array confirming the key pool is reachable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_admin_add_and_list_provider_key() {
+    let harness = TestHarnessBuilder::new()
+        .with_openai()
+        .with_admin()
+        .build()
+        .await;
+
+    // POST a new key.  `type` is the serde-rename for `key_type`.
+    let add_resp = harness
+        .client
+        .admin_post(
+            "providers/openai/keys",
+            json!({
+                "id": "new-key",
+                "type": "static",
+                "api_key": "sk-new",
+                "weight": 1.0
+            }),
+        )
+        .await;
+
+    let status = add_resp.status().as_u16();
+    assert!(
+        status == 200 || status == 201,
+        "add provider key must return 200 or 201; got: {status}"
+    );
+
+    // List the keys for the openai provider.
+    let list_resp = harness.client.admin_get("providers/openai/keys").await;
+    assert_eq!(
+        list_resp.status().as_u16(),
+        200,
+        "list provider keys must return 200"
+    );
+
+    let body: serde_json::Value = list_resp
+        .json()
+        .await
+        .expect("list provider keys must return JSON");
+    assert!(
+        body.is_array(),
+        "list provider keys must return a JSON array; got: {body}"
+    );
+}
+
+/// `PUT /admin/api/v1/model-selection` must persist the new config and return
+/// 200.  A subsequent `GET` must reflect the updated `mode` field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_admin_update_model_selection() {
+    let harness = TestHarnessBuilder::new()
+        .with_openai()
+        .with_admin()
+        .build()
+        .await;
+
+    let put_resp = harness
+        .client
+        .admin_put(
+            "model-selection",
+            json!({
+                "mode": "static",
+                "model": "gpt-4o",
+                "header": "x-model",
+                "fallback": null,
+                "mappings": {},
+                "allowed_models": [],
+                "overrides": {}
+            }),
+        )
+        .await;
+
+    assert_eq!(
+        put_resp.status().as_u16(),
+        200,
+        "PUT model-selection must return 200"
+    );
+
+    // Read back and verify the mode was updated.
+    let get_resp = harness.client.admin_get("model-selection").await;
+    assert_eq!(
+        get_resp.status().as_u16(),
+        200,
+        "GET model-selection must return 200"
+    );
+
+    let body: serde_json::Value = get_resp
+        .json()
+        .await
+        .expect("GET model-selection must return JSON");
+    assert_eq!(
+        body["mode"], "static",
+        "model-selection mode must be 'static' after PUT; got: {body}"
+    );
+}
+
+/// `PUT /admin/api/v1/guardrails` must persist the new config and return 200.
+/// A subsequent `GET` must reflect `enabled = true`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_admin_update_guardrails() {
+    let harness = TestHarnessBuilder::new()
+        .with_openai()
+        .with_admin()
+        .build()
+        .await;
+
+    let put_resp = harness
+        .client
+        .admin_put(
+            "guardrails",
+            json!({
+                "enabled": true,
+                "fail_mode": "open",
+                "timeout": "500ms",
+                "streaming_mode": "async_audit",
+                "engines": []
+            }),
+        )
+        .await;
+
+    assert_eq!(
+        put_resp.status().as_u16(),
+        200,
+        "PUT guardrails must return 200"
+    );
+
+    // Read back and verify enabled was updated.
+    let get_resp = harness.client.admin_get("guardrails").await;
+    assert_eq!(
+        get_resp.status().as_u16(),
+        200,
+        "GET guardrails must return 200"
+    );
+
+    let body: serde_json::Value = get_resp
+        .json()
+        .await
+        .expect("GET guardrails must return JSON");
+    assert_eq!(
+        body["enabled"], true,
+        "guardrails enabled must be true after PUT; got: {body}"
+    );
+}
+
+/// `PUT /admin/api/v1/rate-limits` must persist the new config and return 200.
+/// A subsequent `GET` must reflect the updated `default_rpm`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_admin_update_rate_limits() {
+    let harness = TestHarnessBuilder::new()
+        .with_openai()
+        .with_admin()
+        .build()
+        .await;
+
+    let put_resp = harness
+        .client
+        .admin_put(
+            "rate-limits",
+            json!({
+                "enabled": true,
+                "default_rpm": 100,
+                "default_tpm": 500000,
+                "overrides": {}
+            }),
+        )
+        .await;
+
+    assert_eq!(
+        put_resp.status().as_u16(),
+        200,
+        "PUT rate-limits must return 200"
+    );
+
+    // Read back and verify default_rpm was updated.
+    let get_resp = harness.client.admin_get("rate-limits").await;
+    assert_eq!(
+        get_resp.status().as_u16(),
+        200,
+        "GET rate-limits must return 200"
+    );
+
+    let body: serde_json::Value = get_resp
+        .json()
+        .await
+        .expect("GET rate-limits must return JSON");
+    assert_eq!(
+        body["default_rpm"], 100,
+        "rate-limits default_rpm must be 100 after PUT; got: {body}"
+    );
+}
+
+/// Full lifecycle for a per-entity rate limit override:
+///
+/// 1. `PUT  /admin/api/v1/rate-limits/overrides/alice` → 200
+/// 2. `GET  /admin/api/v1/rate-limits/overrides`       → array must contain alice
+/// 3. `DELETE /admin/api/v1/rate-limits/overrides/alice` → 200 or 204
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_admin_rate_limit_override_lifecycle() {
+    let harness = TestHarnessBuilder::new()
+        .with_openai()
+        .with_admin()
+        .build()
+        .await;
+
+    // 1. Set the override.
+    let put_resp = harness
+        .client
+        .admin_put(
+            "rate-limits/overrides/alice",
+            json!({"rpm": 50, "tpm": 100000}),
+        )
+        .await;
+    assert_eq!(
+        put_resp.status().as_u16(),
+        200,
+        "PUT rate-limits/overrides/alice must return 200"
+    );
+
+    // 2. List overrides — alice must be present.
+    let list_resp = harness.client.admin_get("rate-limits/overrides").await;
+    assert_eq!(
+        list_resp.status().as_u16(),
+        200,
+        "GET rate-limits/overrides must return 200"
+    );
+
+    let body: serde_json::Value = list_resp
+        .json()
+        .await
+        .expect("GET rate-limits/overrides must return JSON");
+    let overrides = body["overrides"]
+        .as_array()
+        .expect("rate-limits/overrides response must have an 'overrides' array");
+    let has_alice = overrides.iter().any(|entry| entry["id"] == "alice");
+    assert!(
+        has_alice,
+        "overrides list must contain alice after PUT; got: {body}"
+    );
+
+    // 3. Delete the override.
+    let del_resp = harness
+        .client
+        .admin_delete("rate-limits/overrides/alice")
+        .await;
+    let del_status = del_resp.status().as_u16();
+    assert!(
+        del_status == 200 || del_status == 204,
+        "DELETE rate-limits/overrides/alice must return 200 or 204; got: {del_status}"
+    );
+}
+
+/// `PUT /admin/api/v1/routing/semantic` must persist the config and return 200.
+/// A subsequent `GET` must reflect `semantic.enabled = false`.
+///
+/// The `routing/semantic` API uses `RoutingConfig` which wraps
+/// `SemanticRoutingConfig` under the `"semantic"` key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_admin_semantic_routing_update() {
+    let harness = TestHarnessBuilder::new()
+        .with_openai()
+        .with_admin()
+        .build()
+        .await;
+
+    let put_resp = harness
+        .client
+        .admin_put(
+            "routing/semantic",
+            json!({
+                "semantic": {
+                    "enabled": false,
+                    "classifier": "heuristic",
+                    "rules": [],
+                    "default": {"preferred_models": []}
+                }
+            }),
+        )
+        .await;
+
+    assert_eq!(
+        put_resp.status().as_u16(),
+        200,
+        "PUT routing/semantic must return 200"
+    );
+
+    // Read back and verify enabled is false.
+    let get_resp = harness.client.admin_get("routing/semantic").await;
+    assert_eq!(
+        get_resp.status().as_u16(),
+        200,
+        "GET routing/semantic must return 200"
+    );
+
+    let body: serde_json::Value = get_resp
+        .json()
+        .await
+        .expect("GET routing/semantic must return JSON");
+    assert_eq!(
+        body["semantic"]["enabled"], false,
+        "routing/semantic enabled must be false after PUT; got: {body}"
+    );
+}

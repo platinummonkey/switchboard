@@ -82,6 +82,24 @@ impl TestClient {
             .expect("anthropic_messages_stream request failed")
     }
 
+    /// `POST /v1/chat/completions` with the test API key plus extra headers.
+    ///
+    /// Used by identity-resolution tests that need to inject
+    /// `x-switchboard-user`, `x-switchboard-tool`, or JWT-claim headers.
+    pub async fn chat_with_extra_headers(&self, body: Value, extra: &[(&str, &str)]) -> Response {
+        let mut req = self
+            .inner
+            .post(format!("{}/v1/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body);
+        for (name, value) in extra {
+            req = req.header(*name, *value);
+        }
+        req.send()
+            .await
+            .expect("chat_with_extra_headers request failed")
+    }
+
     /// `POST /v1/chat/completions` WITHOUT any Authorization header.
     ///
     /// Used to test that unauthenticated requests are rejected with 401.
@@ -134,6 +152,27 @@ impl TestClient {
             .send()
             .await
             .expect("admin_get request failed")
+    }
+
+    /// `PUT /admin/api/v1/{path}` with the test API key and a JSON body.
+    pub async fn admin_put(&self, path: &str, body: Value) -> Response {
+        self.inner
+            .put(format!("{}/admin/api/v1/{}", self.admin_base(), path))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .json(&body)
+            .send()
+            .await
+            .expect("admin_put request failed")
+    }
+
+    /// `DELETE /admin/api/v1/{path}` with the test API key.
+    pub async fn admin_delete(&self, path: &str) -> Response {
+        self.inner
+            .delete(format!("{}/admin/api/v1/{}", self.admin_base(), path))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .send()
+            .await
+            .expect("admin_delete request failed")
     }
 
     /// `POST /admin/api/v1/{path}` with the test API key and a JSON body.

@@ -65,3 +65,5 @@ toml = { workspace = true }
 wiremock = { workspace = true }
 tokio = { workspace = true }
 tempfile = "3"
+switchboard-server = { path = "../switchboard-server", default-features = false }
+axum = { workspace = true }

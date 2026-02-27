@@ -9,8 +9,10 @@ use wiremock::MockServer;
 
 use switchboard_server::config::admin::AdminConfig;
 use switchboard_server::config::guardrails::GuardrailsConfig;
+use switchboard_server::config::model_selection::ModelSelectionConfig;
 use switchboard_server::config::provider::{KeyEntry, KeyPoolConfig, ProviderConfig};
 use switchboard_server::config::rate_limit::RateLimitConfig;
+use switchboard_server::config::routing::RoutingConfig;
 use switchboard_server::config::{AuthConfig, ServerConfig, ValidatorConfig};
 
 /// Handles to all optional per-provider wiremock mock servers.
@@ -33,6 +35,13 @@ pub struct BuildOpts {
     pub guardrails: Option<GuardrailsConfig>,
     /// Optional rate limit `(default_rpm, default_tpm)`.
     pub rate_limit: Option<(u32, u32)>,
+    /// Optional model-selection policy override.
+    pub model_selection: Option<ModelSelectionConfig>,
+    /// Optional semantic routing config override.
+    pub routing: Option<RoutingConfig>,
+    /// Multi-key OpenAI pool `([(id, api_key)], selector)`.
+    /// When `Some`, replaces the default single-key OpenAI pool entry.
+    pub openai_extra_keys: Option<(Vec<(String, String)>, String)>,
 }
 
 impl Default for BuildOpts {
@@ -42,6 +51,9 @@ impl Default for BuildOpts {
             admin_listen: "127.0.0.1:19500".into(),
             guardrails: None,
             rate_limit: None,
+            model_selection: None,
+            routing: None,
+            openai_extra_keys: None,
         }
     }
 }
@@ -56,6 +68,40 @@ pub fn build_test_config(mocks: &ProviderMocks, opts: &BuildOpts) -> ServerConfi
     let mut providers = HashMap::new();
 
     if let Some(ref mock) = mocks.openai {
+        // Build the key pool — either from opts.openai_extra_keys (multi-key)
+        // or the default single test key.
+        let key_pool = if let Some((ref keys, ref selector)) = opts.openai_extra_keys {
+            KeyPoolConfig {
+                selector: selector.clone(),
+                keys: keys
+                    .iter()
+                    .map(|(id, api_key)| KeyEntry {
+                        id: id.clone(),
+                        key_type: "static".into(),
+                        api_key: Some(api_key.clone()),
+                        role_arn: None,
+                        region: None,
+                        refresh_interval: None,
+                        vault_path: None,
+                        weight: 1.0,
+                    })
+                    .collect(),
+            }
+        } else {
+            KeyPoolConfig {
+                selector: "weighted_random".into(),
+                keys: vec![KeyEntry {
+                    id: "openai-test-key".into(),
+                    key_type: "static".into(),
+                    api_key: Some("sk-test-openai".into()),
+                    role_arn: None,
+                    region: None,
+                    refresh_interval: None,
+                    vault_path: None,
+                    weight: 1.0,
+                }],
+            }
+        };
         providers.insert(
             "openai".to_string(),
             ProviderConfig {
@@ -68,19 +114,7 @@ pub fn build_test_config(mocks: &ProviderMocks, opts: &BuildOpts) -> ServerConfi
                 timeout: "30s".into(),
                 health_check_interval: "30s".into(),
                 max_concurrent: 10,
-                key_pool: KeyPoolConfig {
-                    selector: "weighted_random".into(),
-                    keys: vec![KeyEntry {
-                        id: "openai-test-key".into(),
-                        key_type: "static".into(),
-                        api_key: Some("sk-test-openai".into()),
-                        role_arn: None,
-                        region: None,
-                        refresh_interval: None,
-                        vault_path: None,
-                        weight: 1.0,
-                    }],
-                },
+                key_pool,
             },
         );
     }
@@ -252,12 +286,17 @@ pub fn build_test_config(mocks: &ProviderMocks, opts: &BuildOpts) -> ServerConfi
         RateLimitConfig::default()
     };
 
+    let model_selection = opts.model_selection.clone().unwrap_or_default();
+    let routing = opts.routing.clone().unwrap_or_default();
+
     ServerConfig {
         providers,
         auth: AuthConfig { validators },
         admin,
         guardrails,
         rate_limit,
+        model_selection,
+        routing,
         ..ServerConfig::default()
     }
 }

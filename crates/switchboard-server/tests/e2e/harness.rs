@@ -5,6 +5,8 @@ use std::net::SocketAddr;
 use wiremock::MockServer;
 
 use switchboard_server::config::guardrails::{EngineConfig, GuardrailsConfig};
+use switchboard_server::config::model_selection::ModelSelectionConfig;
+use switchboard_server::config::routing::RoutingConfig;
 
 use crate::client::TestClient;
 use crate::config::{BuildOpts, ProviderMocks};
@@ -44,6 +46,13 @@ pub struct TestHarnessBuilder {
     pub guardrails: Option<GuardrailsConfig>,
     /// `(default_rpm, default_tpm)` — enables rate limiting when `Some`.
     pub rate_limit: Option<(u32, u32)>,
+    /// Override model-selection policy.
+    pub model_selection: Option<ModelSelectionConfig>,
+    /// Override semantic routing config.
+    pub routing: Option<RoutingConfig>,
+    /// Extra API keys for the OpenAI pool `(id, api_key_value)` plus selector.
+    /// When set, replaces the single default key.
+    pub openai_extra_keys: Option<(Vec<(String, String)>, String)>,
 }
 
 impl Default for TestHarnessBuilder {
@@ -57,6 +66,9 @@ impl Default for TestHarnessBuilder {
             admin_enabled: false,
             guardrails: None,
             rate_limit: None,
+            model_selection: None,
+            routing: None,
+            openai_extra_keys: None,
         }
     }
 }
@@ -134,6 +146,37 @@ impl TestHarnessBuilder {
         self
     }
 
+    /// Override the model-selection policy (default: dynamic).
+    pub fn with_model_selection(mut self, cfg: ModelSelectionConfig) -> Self {
+        self.model_selection = Some(cfg);
+        self
+    }
+
+    /// Override the semantic routing config.
+    pub fn with_routing(mut self, cfg: RoutingConfig) -> Self {
+        self.routing = Some(cfg);
+        self
+    }
+
+    /// Configure the OpenAI pool with multiple named keys and a specific
+    /// selector strategy (e.g. `"round_robin"`, `"weighted_random"`).
+    ///
+    /// `keys` is a list of `(id, api_key_value)` pairs.  The server forwards
+    /// each key's value as `Authorization: Bearer <api_key_value>` so tests
+    /// can inspect which key was selected by examining upstream request headers.
+    pub fn with_openai_keys(
+        mut self,
+        keys: Vec<(impl Into<String>, impl Into<String>)>,
+        selector: impl Into<String>,
+    ) -> Self {
+        let keys = keys
+            .into_iter()
+            .map(|(id, k)| (id.into(), k.into()))
+            .collect();
+        self.openai_extra_keys = Some((keys, selector.into()));
+        self
+    }
+
     /// Build and start the test harness.
     pub async fn build(self) -> TestHarness {
         // Start wiremock servers for each requested provider.
@@ -187,6 +230,9 @@ impl TestHarnessBuilder {
                 admin_listen,
                 guardrails: self.guardrails,
                 rate_limit: self.rate_limit,
+                model_selection: self.model_selection,
+                routing: self.routing,
+                openai_extra_keys: self.openai_extra_keys,
             },
         );
 
