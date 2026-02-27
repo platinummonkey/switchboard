@@ -97,22 +97,31 @@ pub fn admin_router(state: Arc<AdminState>) -> axum::Router {
 
 // ── Serve ─────────────────────────────────────────────────────────────────────
 
+/// Start the admin server on an already-bound [`tokio::net::TcpListener`].
+///
+/// Useful for tests that need to know the admin server port before starting
+/// (bind to `127.0.0.1:0`, read the port, then pass the listener here).
+pub async fn serve_admin_on_listener(
+    state: Arc<AdminState>,
+    listener: tokio::net::TcpListener,
+) -> Result<(), ServerError> {
+    let router = admin_router(state);
+    tracing::info!(addr = %listener.local_addr().unwrap_or_else(|_| "unknown".parse().unwrap()), "admin server listening");
+    axum::serve(listener, router)
+        .await
+        .map_err(ServerError::Io)?;
+    Ok(())
+}
+
 /// Start the admin server and bind it to `listen`.
 ///
 /// This function runs until the server is stopped (e.g., via a signal or
 /// the handle being dropped). Typically called inside `tokio::spawn`.
 pub async fn serve_admin(state: Arc<AdminState>, listen: &str) -> Result<(), ServerError> {
-    let router = admin_router(state);
     let listener = tokio::net::TcpListener::bind(listen)
         .await
         .map_err(ServerError::Io)?;
-
-    tracing::info!(addr = %listen, "admin server listening");
-    axum::serve(listener, router)
-        .await
-        .map_err(ServerError::Io)?;
-
-    Ok(())
+    serve_admin_on_listener(state, listener).await
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

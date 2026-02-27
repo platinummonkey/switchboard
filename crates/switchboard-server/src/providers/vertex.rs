@@ -44,6 +44,10 @@ pub struct VertexProvider {
     models: Vec<String>,
     /// Shared reqwest client.
     client: reqwest::Client,
+    /// Optional base URL override. When set, replaces
+    /// `https://{region}-aiplatform.googleapis.com` in endpoint URLs.
+    /// Used in tests to redirect traffic to a wiremock server.
+    base_url: Option<String>,
 }
 
 impl VertexProvider {
@@ -73,6 +77,7 @@ impl VertexProvider {
             project_id,
             models: config.models.clone(),
             client,
+            base_url: config.base_url.clone(),
         })
     }
 
@@ -95,18 +100,30 @@ impl VertexProvider {
             project_id: project_id.into(),
             models,
             client,
+            base_url: None,
         }
     }
 
     /// Build the Vertex AI generateContent endpoint URL.
+    ///
+    /// When `base_url` is set (e.g., for tests), it replaces the
+    /// `https://{region}-aiplatform.googleapis.com` origin while the
+    /// canonical Vertex path is appended unchanged, so wiremock path-regex
+    /// matchers (`:generateContent$`) still fire correctly.
     fn endpoint_url(&self, model: &str, streaming: bool) -> String {
         let action = if streaming {
             "streamGenerateContent?alt=sse"
         } else {
             "generateContent"
         };
+        let base = if let Some(ref b) = self.base_url {
+            b.trim_end_matches('/').to_string()
+        } else {
+            format!("https://{}-aiplatform.googleapis.com", self.region)
+        };
         format!(
-            "https://{region}-aiplatform.googleapis.com/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:{action}",
+            "{base}/v1/projects/{project}/locations/{region}/publishers/google/models/{model}:{action}",
+            base = base,
             region = self.region,
             project = self.project_id,
             model = model,

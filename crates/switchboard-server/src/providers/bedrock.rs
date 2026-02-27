@@ -109,6 +109,10 @@ pub struct BedrockProvider {
     models: Vec<String>,
     /// Shared reqwest client (no default Auth header — we sign each request).
     client: reqwest::Client,
+    /// Optional base URL override. When set, replaces
+    /// `https://bedrock-runtime.{region}.amazonaws.com` in endpoint URLs.
+    /// Used in tests to redirect traffic to a wiremock server.
+    base_url: Option<String>,
 }
 
 impl BedrockProvider {
@@ -131,6 +135,7 @@ impl BedrockProvider {
             cross_region_inference: config.cross_region_inference,
             models: config.models.clone(),
             client,
+            base_url: config.base_url.clone(),
         })
     }
 
@@ -151,6 +156,7 @@ impl BedrockProvider {
             cross_region_inference,
             models,
             client,
+            base_url: None,
         }
     }
 
@@ -173,7 +179,13 @@ impl BedrockProvider {
             model_id.to_string()
         };
 
-        format!("https://bedrock-runtime.{region}.amazonaws.com/model/{effective_model}/{action}")
+        let base = if let Some(ref b) = self.base_url {
+            b.trim_end_matches('/').to_string()
+        } else {
+            format!("https://bedrock-runtime.{region}.amazonaws.com")
+        };
+
+        format!("{base}/model/{effective_model}/{action}")
     }
 
     /// Build a Bedrock Converse request body from a [`ProxiedRequest`].
