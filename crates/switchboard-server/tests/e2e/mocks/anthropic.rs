@@ -47,6 +47,33 @@ pub fn mock_messages_streaming(text_delta: &str) -> Mock {
         )
 }
 
+/// Response containing a `tool_use` content block (Anthropic function calling).
+///
+/// `tool_use_id` is the ID the client must echo back in the `tool_result`.
+/// `input` is the JSON object the model wants to pass to the tool.
+pub fn mock_messages_with_tool_use(
+    tool_name: &str,
+    tool_use_id: &str,
+    input: serde_json::Value,
+) -> Mock {
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "msg_tool_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": tool_name,
+                "input": input
+            }],
+            "model": "claude-3-5-sonnet-20241022",
+            "stop_reason": "tool_use",
+            "usage": { "input_tokens": 20, "output_tokens": 15 }
+        })))
+}
+
 /// Error response from Anthropic.
 pub fn mock_messages_error(status: u16, error_type: &str, message: &str) -> Mock {
     Mock::given(method("POST"))

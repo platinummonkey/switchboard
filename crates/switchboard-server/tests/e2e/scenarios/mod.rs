@@ -6,6 +6,7 @@ pub mod admin_e2e_test;
 pub mod anthropic_test;
 pub mod auth_e2e_test;
 pub mod bedrock_test;
+pub mod concurrent_test;
 pub mod failover_test;
 pub mod guardrails_e2e_test;
 pub mod identity_test;
@@ -18,6 +19,7 @@ pub mod request_id_test;
 pub mod routing_test;
 pub mod semantic_routing_e2e_test;
 pub mod streaming_e2e_test;
+pub mod tool_call_test;
 pub mod usage_e2e_test;
 pub mod vertex_test;
 

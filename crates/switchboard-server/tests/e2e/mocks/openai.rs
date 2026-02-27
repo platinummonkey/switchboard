@@ -59,6 +59,61 @@ pub fn mock_chat_error(status: u16, message: &str) -> Mock {
         })))
 }
 
+/// Response containing one or more tool calls (function calling).
+///
+/// `calls` is a slice of `(call_id, function_name, arguments_json_string)`.
+/// The response uses `finish_reason: "tool_calls"` with a null content body.
+pub fn mock_chat_with_tool_calls(calls: &[(&str, &str, &str)]) -> Mock {
+    let tool_calls: Vec<serde_json::Value> = calls
+        .iter()
+        .map(|(id, name, args)| {
+            json!({
+                "id": id,
+                "type": "function",
+                "function": { "name": name, "arguments": args }
+            })
+        })
+        .collect();
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-tool-test",
+            "object": "chat.completion",
+            "created": 1_700_000_000_u64,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": tool_calls
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": { "prompt_tokens": 20, "completion_tokens": 15, "total_tokens": 35 }
+        })))
+}
+
+/// Tool result follow-up response after a tool call has been executed.
+/// Returns a normal assistant message as the final response.
+pub fn mock_chat_after_tool(content: &str) -> Mock {
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "chatcmpl-tool-result",
+            "object": "chat.completion",
+            "created": 1_700_000_000_u64,
+            "model": "gpt-4o",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": content },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 30, "completion_tokens": 10, "total_tokens": 40 }
+        })))
+}
+
 /// Models list response for health checks.
 #[allow(dead_code)]
 pub fn mock_models_ok() -> Mock {

@@ -400,3 +400,284 @@ async fn test_e2e_multiple_guardrail_engines_first_blocks() {
         "request matching the first engine keyword must be rejected with 403 Forbidden"
     );
 }
+
+// ── Post-response guardrail helpers ───────────────────────────────────────────
+
+/// Build a `GuardrailsConfig` with a single `builtin_keyword` post-response
+/// engine that blocks responses containing any of the given `keywords`.
+fn post_response_keyword_guardrail(keywords: Vec<String>) -> GuardrailsConfig {
+    GuardrailsConfig {
+        enabled: true,
+        fail_mode: "open".into(),
+        timeout: "500ms".into(),
+        streaming_mode: "async_audit".into(),
+        engines: vec![EngineConfig {
+            engine_type: "builtin_keyword".into(),
+            phase: "post_response".into(), // ← post_response phase
+            action: Some("block".into()),
+            keywords,
+            rules: vec![],
+            max_input_tokens: None,
+            max_output_tokens: None,
+            endpoint: None,
+            timeout: None,
+            tls: false,
+            headers: Default::default(),
+        }],
+    }
+}
+
+// ── Post-response guardrail tests ─────────────────────────────────────────────
+
+/// 10. When the upstream returns a response whose content contains a blocked
+///     keyword, the post-response guardrail intercepts and blocks it with 403.
+///     The request itself was clean — only the response triggered the guardrail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_post_response_guardrail_blocks_toxic_response() {
+    let harness = TestHarnessBuilder::new()
+        .with_openai()
+        .with_guardrails(post_response_keyword_guardrail(vec![
+            "TOXIC_CONTENT".into(),
+        ]))
+        .build()
+        .await;
+
+    let mock_server = harness
+        .mocks
+        .openai
+        .as_ref()
+        .expect("openai mock must be present");
+    // The upstream returns a response containing the blocked keyword.
+    openai::mock_chat_ok("gpt-4o", "This response contains TOXIC_CONTENT.")
+        .mount(mock_server)
+        .await;
+
+    // The request itself is clean — no keyword in the prompt.
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Tell me something helpful."}]
+    });
+
+    let resp = harness.client.chat_completions(body).await;
+    // The post-response guardrail must intercept the toxic response and block
+    // it with 403 Forbidden. The upstream was called (request was clean) but
+    // the response is suppressed.
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "response containing a blocked keyword must be rejected with 403 Forbidden"
+    );
+
+    let json: serde_json::Value = resp.json().await.expect("response must be valid JSON");
+    assert_eq!(
+        json["error"], "forbidden",
+        "blocked response body must have error=forbidden"
+    );
+}
+
+/// 11. When the upstream returns a clean response, the post-response guardrail
+///     configured with a keyword that is absent from the response passes it
+///     through with the original 200 OK status.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_post_response_guardrail_allows_clean_response() {
+    let harness = TestHarnessBuilder::new()
+        .with_openai()
+        .with_guardrails(post_response_keyword_guardrail(vec![
+            "TOXIC_CONTENT".into(),
+        ]))
+        .build()
+        .await;
+
+    let mock_server = harness
+        .mocks
+        .openai
+        .as_ref()
+        .expect("openai mock must be present");
+    // The upstream returns a response that does NOT contain the blocked keyword.
+    openai::mock_chat_ok("gpt-4o", "This is a safe and helpful response.")
+        .mount(mock_server)
+        .await;
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Tell me something helpful."}]
+    });
+
+    let resp = harness.client.chat_completions(body).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "clean response must pass through the post-response guardrail with 200 OK"
+    );
+
+    let json: serde_json::Value = resp.json().await.expect("response must be valid JSON");
+    assert_eq!(
+        json["choices"][0]["message"]["content"], "This is a safe and helpful response.",
+        "clean response content must be forwarded unchanged"
+    );
+}
+
+/// 12. Unlike pre-request blocking (which short-circuits before the upstream is
+///     called), a post-response guardrail always calls the upstream first and
+///     only evaluates the response it receives.  This test verifies that the
+///     upstream mock receives exactly one request even though the response is
+///     subsequently blocked by the guardrail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_post_response_guardrail_upstream_still_called() {
+    let harness = TestHarnessBuilder::new()
+        .with_openai()
+        .with_guardrails(post_response_keyword_guardrail(vec![
+            "TOXIC_CONTENT".into(),
+        ]))
+        .build()
+        .await;
+
+    let mock_server = harness
+        .mocks
+        .openai
+        .as_ref()
+        .expect("openai mock must be present");
+    openai::mock_chat_ok("gpt-4o", "Contains TOXIC_CONTENT here.")
+        .mount(mock_server)
+        .await;
+
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Tell me something."}]
+    });
+
+    harness.client.chat_completions(body).await;
+
+    // The upstream must have received exactly one request.  This distinguishes
+    // post-response blocking (upstream is always called) from pre-request
+    // blocking (upstream is never called when blocked before forwarding).
+    assert_received_n(mock_server, 1).await;
+}
+
+// ── Combined pre + post guardrail tests ───────────────────────────────────────
+
+/// Build a `GuardrailsConfig` with two engines:
+/// - A `builtin_keyword` pre-request engine blocking `pre_keyword`.
+/// - A `builtin_keyword` post-response engine blocking `post_keyword`.
+fn combined_guardrail(pre_keyword: &str, post_keyword: &str) -> GuardrailsConfig {
+    GuardrailsConfig {
+        enabled: true,
+        fail_mode: "open".into(),
+        timeout: "500ms".into(),
+        streaming_mode: "async_audit".into(),
+        engines: vec![
+            EngineConfig {
+                engine_type: "builtin_keyword".into(),
+                phase: "pre_request".into(),
+                action: Some("block".into()),
+                keywords: vec![pre_keyword.into()],
+                rules: vec![],
+                max_input_tokens: None,
+                max_output_tokens: None,
+                endpoint: None,
+                timeout: None,
+                tls: false,
+                headers: Default::default(),
+            },
+            EngineConfig {
+                engine_type: "builtin_keyword".into(),
+                phase: "post_response".into(),
+                action: Some("block".into()),
+                keywords: vec![post_keyword.into()],
+                rules: vec![],
+                max_input_tokens: None,
+                max_output_tokens: None,
+                endpoint: None,
+                timeout: None,
+                tls: false,
+                headers: Default::default(),
+            },
+        ],
+    }
+}
+
+/// 13. With a combined pre + post pipeline: a request that contains the
+///     pre-request blocked keyword is rejected with 403 before the upstream is
+///     ever called.  The post-response engine never runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_combined_pre_blocks_before_upstream() {
+    let harness = TestHarnessBuilder::new()
+        .with_openai()
+        .with_guardrails(combined_guardrail("BLOCKED_INPUT", "BLOCKED_OUTPUT"))
+        .build()
+        .await;
+
+    let mock_server = harness
+        .mocks
+        .openai
+        .as_ref()
+        .expect("openai mock must be present");
+    // Mount a mock that would return a clean response — it must never fire.
+    openai::mock_chat_ok("gpt-4o", "A perfectly safe answer.")
+        .mount(mock_server)
+        .await;
+
+    // Request contains the pre-request blocked keyword.
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Please process this BLOCKED_INPUT for me."}]
+    });
+
+    let resp = harness.client.chat_completions(body).await;
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "request containing the pre-request blocked keyword must be rejected with 403"
+    );
+
+    // The upstream must have received zero requests — pre-request blocking
+    // short-circuits the pipeline before forwarding.
+    assert_received_n(mock_server, 0).await;
+}
+
+/// 14. With the same combined pre + post pipeline: a clean request passes the
+///     pre-request engine, reaches the upstream, and is then blocked by the
+///     post-response engine because the response contains the post keyword.
+///     The upstream was called exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_combined_post_blocks_after_upstream() {
+    let harness = TestHarnessBuilder::new()
+        .with_openai()
+        .with_guardrails(combined_guardrail("BLOCKED_INPUT", "BLOCKED_OUTPUT"))
+        .build()
+        .await;
+
+    let mock_server = harness
+        .mocks
+        .openai
+        .as_ref()
+        .expect("openai mock must be present");
+    // The upstream returns a response containing the post-response blocked keyword.
+    openai::mock_chat_ok("gpt-4o", "Here is content that contains BLOCKED_OUTPUT.")
+        .mount(mock_server)
+        .await;
+
+    // The request is clean — it does not contain BLOCKED_INPUT.
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "Please give me a helpful answer."}]
+    });
+
+    let resp = harness.client.chat_completions(body).await;
+    // The post-response guardrail intercepts the toxic upstream response.
+    assert_eq!(
+        resp.status().as_u16(),
+        403,
+        "response containing the post-response blocked keyword must be rejected with 403"
+    );
+
+    let json: serde_json::Value = resp.json().await.expect("response must be valid JSON");
+    assert_eq!(
+        json["error"], "forbidden",
+        "blocked response body must have error=forbidden"
+    );
+
+    // The upstream was called exactly once — the request passed the pre-request
+    // engine and was forwarded to the provider before the response was blocked.
+    assert_received_n(mock_server, 1).await;
+}
