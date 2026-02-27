@@ -537,35 +537,28 @@ pub async fn put_semantic_routing(
     )
 }
 
-// ── Users / Usage stubs ───────────────────────────────────────────────────────
+// ── Users / Usage handlers ────────────────────────────────────────────────────
 
-/// `GET /admin/api/v1/users` — stub returning empty list (full impl Phase 16).
+/// `GET /admin/api/v1/users` — list users with usage counters.
 pub async fn list_users(
-    State(_state): State<Arc<AdminState>>,
+    State(state): State<Arc<AdminState>>,
     _auth: AdminAuth,
 ) -> impl IntoResponse {
+    let users = state.usage.by_user();
+    let total = users.len();
     (
         StatusCode::OK,
-        Json(serde_json::json!({"users": [], "total": 0})),
+        Json(serde_json::json!({"users": users, "total": total})),
     )
 }
 
-/// `GET /admin/api/v1/usage` — stub returning zeroed stats.
+/// `GET /admin/api/v1/usage` — current usage totals by provider/model/user.
 pub async fn get_usage(
-    State(_state): State<Arc<AdminState>>,
+    State(state): State<Arc<AdminState>>,
     _auth: AdminAuth,
 ) -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "total_requests": 0,
-            "total_input_tokens": 0,
-            "total_output_tokens": 0,
-            "requests_by_provider": {},
-            "requests_by_model": {},
-            "requests_by_user": {}
-        })),
-    )
+    let totals = state.usage.totals();
+    (StatusCode::OK, Json(totals))
 }
 
 // ── Rate Limits handlers ──────────────────────────────────────────────────────

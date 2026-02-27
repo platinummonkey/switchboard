@@ -26,7 +26,7 @@ use switchboard_server::key_pool::{
 use switchboard_server::middleware::{
     GuardrailLayer, MiddlewareConfig, RateLimitSettings, build_middleware_stack,
 };
-use switchboard_server::observability;
+use switchboard_server::observability::{self, UsageTracker};
 use switchboard_server::providers::{
     AnthropicProvider, BedrockProvider, OllamaProvider, OpenAiProvider, ProviderRegistry,
     VertexProvider,
@@ -94,10 +94,15 @@ async fn main() -> Result<()> {
     // Build provider registry and key pools from config.
     let (provider_registry, key_pools) = build_providers(&server_config).await;
 
+    // Create a shared usage tracker — the same Arc is held by both AppState
+    // (written by proxy handlers) and AdminState (read by admin API).
+    let usage = Arc::new(UsageTracker::new());
+
     let app_state = Arc::new(AppState {
         config: Arc::new(server_config),
         providers: Arc::new(provider_registry),
         key_pools: Arc::new(key_pools),
+        usage: Arc::clone(&usage),
     });
 
     // Spawn the admin server if enabled.
@@ -124,6 +129,7 @@ async fn main() -> Result<()> {
             )),
             Arc::new(admin_pools),
             admin_auth_state,
+            Arc::clone(&usage),
         ));
 
         let admin_listen = app_state.config.admin.listen.clone();

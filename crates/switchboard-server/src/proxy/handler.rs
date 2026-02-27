@@ -24,6 +24,7 @@ use crate::config::IdentityConfig;
 use crate::config::ServerConfig;
 use crate::identity::{HeaderResolver, IdentityChain, JwtClaimResolver, ToolSpecificResolver};
 use crate::key_pool::KeyPool;
+use crate::observability::UsageTracker;
 use crate::providers::ProviderRegistry;
 use crate::proxy::error::ProxyError;
 use crate::proxy::transform::{
@@ -41,6 +42,8 @@ pub struct AppState {
     pub providers: Arc<ProviderRegistry>,
     /// Key pools keyed by provider name (matches `config.providers` keys).
     pub key_pools: Arc<HashMap<String, Arc<KeyPool>>>,
+    /// In-memory usage tracker (shared with admin API).
+    pub usage: Arc<UsageTracker>,
 }
 
 // ── Route handlers ────────────────────────────────────────────────────────────
@@ -119,6 +122,15 @@ pub async fn chat_completions(
                 ProxyError::Upstream(e.to_string()).into_response()
             }
             Ok(resp) => {
+                if let Some(usage) = &resp.usage {
+                    state.usage.record(
+                        ctx.user_id.as_deref().unwrap_or("anonymous"),
+                        &resp.model,
+                        &provider_name,
+                        usage.input_tokens,
+                        usage.output_tokens,
+                    );
+                }
                 let json = proxied_to_openai(&resp);
                 Json(json).into_response()
             }
@@ -193,6 +205,15 @@ pub async fn anthropic_messages(
                 ProxyError::Upstream(e.to_string()).into_response()
             }
             Ok(resp) => {
+                if let Some(usage) = &resp.usage {
+                    state.usage.record(
+                        ctx.user_id.as_deref().unwrap_or("anonymous"),
+                        &resp.model,
+                        &provider_name,
+                        usage.input_tokens,
+                        usage.output_tokens,
+                    );
+                }
                 let json = proxied_to_anthropic(&resp);
                 Json(json).into_response()
             }
@@ -435,6 +456,7 @@ mod tests {
             config: Arc::new(config),
             providers: Arc::new(registry),
             key_pools: Arc::new(key_pools),
+            usage: Arc::new(crate::observability::UsageTracker::new()),
         })
     }
 
@@ -473,6 +495,7 @@ mod tests {
             config: Arc::new(config),
             providers: Arc::new(registry),
             key_pools: Arc::new(key_pools),
+            usage: Arc::new(crate::observability::UsageTracker::new()),
         })
     }
 
@@ -502,6 +525,7 @@ mod tests {
             config: Arc::new(ServerConfig::default()),
             providers: Arc::new(ProviderRegistry::new()),
             key_pools: Arc::new(HashMap::new()),
+            usage: Arc::new(crate::observability::UsageTracker::new()),
         });
         let app = build_router(state);
 
@@ -541,6 +565,7 @@ mod tests {
             config: Arc::new(config),
             providers: Arc::new(ProviderRegistry::new()),
             key_pools: Arc::new(HashMap::new()),
+            usage: Arc::new(crate::observability::UsageTracker::new()),
         });
         let app = build_router(state);
 
@@ -652,6 +677,7 @@ mod tests {
             config: Arc::new(ServerConfig::default()),
             providers: Arc::new(ProviderRegistry::new()),
             key_pools: Arc::new(HashMap::new()),
+            usage: Arc::new(crate::observability::UsageTracker::new()),
         });
         let app = build_router(state);
 
@@ -677,6 +703,7 @@ mod tests {
             config: Arc::new(ServerConfig::default()),
             providers: Arc::new(ProviderRegistry::new()),
             key_pools: Arc::new(HashMap::new()),
+            usage: Arc::new(crate::observability::UsageTracker::new()),
         });
         let app = build_router(state);
 

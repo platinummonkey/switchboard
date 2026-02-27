@@ -30,7 +30,12 @@ fn make_admin_state() -> Arc<AdminState> {
         ..AdminConfig::default()
     };
     let auth_state = Arc::new(AdminAuthState::new(admin_config));
-    Arc::new(AdminState::new(hot_config, pools, auth_state))
+    Arc::new(AdminState::new(
+        hot_config,
+        pools,
+        auth_state,
+        Arc::new(switchboard_server::observability::UsageTracker::new()),
+    ))
 }
 
 // ── Asset embedding tests (require admin-ui feature) ─────────────────────────
