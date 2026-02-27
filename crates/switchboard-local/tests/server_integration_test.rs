@@ -467,3 +467,242 @@ async fn test_local_to_server_model_pref_applied() {
         "model must be rewritten from 'gpt-3.5-turbo' to 'gpt-4o' by the local proxy"
     );
 }
+
+/// Server-down error handling: unreachable server.
+///
+/// Verifies that when `switchboard-local` is configured to forward to a server
+/// address that is not listening (port 1 is always refused), the local proxy
+/// returns a non-200 error response rather than hanging or panicking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_local_returns_error_when_server_unreachable() {
+    // Port 1 is reserved and always produces a connection-refused error.
+    let local_config = build_local_config(
+        "http://127.0.0.1:1",
+        None,
+        None,
+        std::collections::HashMap::new(),
+    );
+    let state = make_local_state(local_config).await;
+    let (local_url, _local_handle) = start_local(state).await;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap();
+
+    let resp = client
+        .post(format!("{local_url}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("request to local proxy must complete (with an error status)");
+
+    assert_ne!(
+        resp.status().as_u16(),
+        200,
+        "unreachable server should not return 200"
+    );
+    // The local proxy should map connection errors to 502 Bad Gateway.
+    assert_eq!(
+        resp.status().as_u16(),
+        502,
+        "expected 502 Bad Gateway when upstream is unreachable"
+    );
+}
+
+/// Server-down error handling: server shuts down mid-flight.
+///
+/// Starts a full three-tier stack, verifies the first request succeeds, then
+/// drops the switchboard-server shutdown sender to stop it.  The second
+/// request — sent after the server has stopped — must return a non-200 error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_local_returns_error_when_server_shuts_down() {
+    // 1. Start wiremock (upstream LLM provider).
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(openai_chat_response("ok"))
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&upstream)
+        .await;
+
+    // 2. Start switchboard-server.
+    let server_config = build_server_config(&upstream.uri());
+    let (server_addr, server_shutdown_tx) = start_server(server_config).await;
+    let server_url = format!("http://{server_addr}");
+
+    // 3. Start switchboard-local.
+    let local_config = build_local_config(&server_url, None, None, HashMap::new());
+    let state = make_local_state(local_config).await;
+    let (local_url, _local_handle) = start_local(state).await;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // 4. First request must succeed (proves the stack is wired correctly).
+    let resp1 = client
+        .post(format!("{local_url}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .expect("first request should succeed");
+    assert_eq!(
+        resp1.status().as_u16(),
+        200,
+        "first request must succeed before server shutdown"
+    );
+
+    // 5. Kill the switchboard-server by dropping its shutdown sender.
+    drop(server_shutdown_tx);
+    // Give the server task a moment to finish its graceful shutdown.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // 6. Second request must fail now that the server is gone.
+    let resp2 = client
+        .post(format!("{local_url}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello again"}]
+        }))
+        .send()
+        .await
+        .expect("second request must complete (with an error status)");
+
+    assert_ne!(
+        resp2.status().as_u16(),
+        200,
+        "request after server shutdown should not return 200"
+    );
+}
+
+/// Local health check is independent of the upstream server.
+///
+/// Even when `switchboard-local` is configured to forward to an unreachable
+/// server, its own `/health` endpoint must return 200 — the health check
+/// reflects the local proxy's own liveness, not the server's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_local_health_check_works_independently_of_server() {
+    // Point at an unreachable address.
+    let local_config = build_local_config(
+        "http://127.0.0.1:1",
+        None,
+        None,
+        std::collections::HashMap::new(),
+    );
+    let state = make_local_state(local_config).await;
+    let (local_url, _local_handle) = start_local(state).await;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    // GET /health must succeed locally — it does not proxy to the server.
+    let resp = client
+        .get(format!("{local_url}/health"))
+        .send()
+        .await
+        .expect("GET /health should always succeed");
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "/health must return 200 even when the upstream server is unreachable"
+    );
+
+    let body: serde_json::Value = resp.json().await.expect("/health response must be JSON");
+    assert_eq!(
+        body["status"].as_str(),
+        Some("ok"),
+        "/health body must contain status: ok"
+    );
+}
+
+/// Timeout behaviour: slow server that accepts but never responds.
+///
+/// Creates a TCP listener that accepts connections and then holds them open
+/// without ever sending a byte.  The local proxy must return an error within
+/// a reasonable wall-clock time rather than blocking forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_local_timeout_on_slow_server() {
+    // Bind a port that will accept connections but never send a response.
+    let black_hole = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind black-hole listener");
+    let black_hole_addr = black_hole.local_addr().expect("no local addr");
+
+    tokio::spawn(async move {
+        loop {
+            match black_hole.accept().await {
+                Ok((_stream, _peer)) => {
+                    // Hold the connection open for a long time — never write
+                    // a single byte back.
+                    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let local_config = build_local_config(
+        &format!("http://{black_hole_addr}"),
+        None,
+        None,
+        std::collections::HashMap::new(),
+    );
+    let state = make_local_state(local_config).await;
+    let (local_url, _local_handle) = start_local(state).await;
+
+    // Use a short reqwest timeout so the test doesn't block for minutes.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap();
+
+    let start = std::time::Instant::now();
+    let result = client
+        .post(format!("{local_url}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await;
+    let elapsed = start.elapsed();
+
+    // The request must either time out at the reqwest layer (Err) or the local
+    // proxy must surface an error status — either way it must NOT succeed with
+    // 200 and must complete within a generous ceiling.
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "request must not hang indefinitely (elapsed: {elapsed:?})"
+    );
+
+    match result {
+        Ok(resp) => {
+            assert_ne!(
+                resp.status().as_u16(),
+                200,
+                "slow/unresponsive server must not produce a 200 response"
+            );
+        }
+        Err(e) => {
+            // A timeout or connection error from reqwest is also acceptable.
+            assert!(
+                e.is_timeout() || e.is_connect() || e.is_request(),
+                "unexpected reqwest error kind: {e}"
+            );
+        }
+    }
+}

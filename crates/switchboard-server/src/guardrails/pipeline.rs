@@ -15,6 +15,7 @@ use crate::guardrails::builtin::engine_from_config;
 use crate::guardrails::engine::{
     GuardrailAction, GuardrailEngine, GuardrailInput, GuardrailVerdict,
 };
+use crate::guardrails::grpc_callout::async_engine_from_config;
 
 // ── FailMode ──────────────────────────────────────────────────────────────────
 
@@ -115,6 +116,9 @@ impl GuardrailPipeline {
     /// Engines in the config whose `phase` is `"pre_request"` go into
     /// `pre_request_engines`; those with `"post_response"` go into
     /// `post_response_engines`.
+    ///
+    /// This synchronous constructor only supports builtin and HTTP callout
+    /// engine types.  For gRPC callout engines use [`Self::from_config_async`].
     pub fn from_config(cfg: &GuardrailsConfig) -> Result<Self, ServerError> {
         let fail_mode = FailMode::from_str(&cfg.fail_mode);
         let timeout = parse_duration(&cfg.timeout);
@@ -125,6 +129,40 @@ impl GuardrailPipeline {
 
         for engine_cfg in &cfg.engines {
             let engine = engine_from_config(engine_cfg)?;
+            match engine_cfg.phase.trim().to_ascii_lowercase().as_str() {
+                "post_response" => post_response_engines.push(engine),
+                _ => pre_request_engines.push(engine),
+            }
+        }
+
+        Ok(Self {
+            pre_request_engines,
+            post_response_engines,
+            fail_mode,
+            timeout,
+            streaming_mode,
+        })
+    }
+
+    /// Async variant of [`Self::from_config`] that also supports the `"grpc"`
+    /// engine type (which requires an async connection step).
+    ///
+    /// For each engine entry the method first tries the async factory
+    /// (`async_engine_from_config`); if the entry is a builtin or HTTP type it
+    /// falls back to the sync factory so that only one code path needs to be
+    /// maintained.
+    pub async fn from_config_async(cfg: &GuardrailsConfig) -> Result<Self, ServerError> {
+        let fail_mode = FailMode::from_str(&cfg.fail_mode);
+        let timeout = parse_duration(&cfg.timeout);
+        let streaming_mode = StreamingMode::from_str(&cfg.streaming_mode);
+
+        let mut pre_request_engines: Vec<Box<dyn GuardrailEngine>> = Vec::new();
+        let mut post_response_engines: Vec<Box<dyn GuardrailEngine>> = Vec::new();
+
+        for engine_cfg in &cfg.engines {
+            // async_engine_from_config handles "grpc"; for all other types it
+            // delegates to the sync builtin factory.
+            let engine = async_engine_from_config(engine_cfg).await?;
             match engine_cfg.phase.trim().to_ascii_lowercase().as_str() {
                 "post_response" => post_response_engines.push(engine),
                 _ => pre_request_engines.push(engine),

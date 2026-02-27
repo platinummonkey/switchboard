@@ -184,3 +184,64 @@ async fn test_e2e_openai_upstream_error_propagated() {
         "expected non-200 when upstream returns 429"
     );
 }
+
+/// `GET /v1/models` must return 200 with `{"object": "list"}` and a non-empty
+/// `"data"` array populated from the server's provider configuration.
+///
+/// The `list_models` handler builds the model list from `state.config.providers`
+/// rather than proxying to an upstream, so no upstream mock call is made.
+/// The OpenAI provider is configured with model `"gpt-4o"` in the test harness,
+/// so that model must appear in the returned list.
+///
+/// Note: `mock_models_ok` is mounted to confirm that the proxy does NOT
+/// forward the request to the upstream OpenAI mock — the mock server's
+/// received-request count must remain 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_list_models_returns_model_list() {
+    use crate::mocks::openai::mock_models_ok;
+
+    let harness = TestHarnessBuilder::new().with_openai().build().await;
+    let openai_mock = harness.mocks.openai.as_ref().unwrap();
+
+    // Mount a mock so we can assert it is NOT called (models are served from
+    // the proxy's own config, not forwarded upstream).
+    mock_models_ok().mount(openai_mock).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{}/v1/models", harness.addr))
+        .header("Authorization", "Bearer test-api-key")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "GET /v1/models must return 200"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(
+        body["object"], "list",
+        "response body must have object=list"
+    );
+
+    let data = body["data"].as_array().expect("data must be a JSON array");
+    assert!(
+        !data.is_empty(),
+        "data array must be non-empty (at least one model registered)"
+    );
+
+    // The OpenAI provider in the test harness registers "gpt-4o".
+    let model_ids: Vec<&str> = data.iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(
+        model_ids.contains(&"gpt-4o"),
+        "model list must contain gpt-4o; got: {model_ids:?}"
+    );
+
+    // The proxy serves this from its own config — the upstream mock must NOT
+    // have received any request.
+    crate::assertions::assert_received_n(openai_mock, 0).await;
+}

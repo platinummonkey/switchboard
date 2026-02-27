@@ -46,6 +46,10 @@ pub struct TestHarnessBuilder {
     pub guardrails: Option<GuardrailsConfig>,
     /// `(default_rpm, default_tpm)` — enables rate limiting when `Some`.
     pub rate_limit: Option<(u32, u32)>,
+    /// Path to a config TOML file for hot-reload tests.
+    /// When set, `run_server` receives this path so `POST /admin/api/v1/config/reload`
+    /// can read the file from disk. Defaults to `""` (no file).
+    pub config_path: String,
     /// Override model-selection policy.
     pub model_selection: Option<ModelSelectionConfig>,
     /// Override semantic routing config.
@@ -69,6 +73,7 @@ impl Default for TestHarnessBuilder {
             model_selection: None,
             routing: None,
             openai_extra_keys: None,
+            config_path: String::new(),
         }
     }
 }
@@ -158,6 +163,16 @@ impl TestHarnessBuilder {
         self
     }
 
+    /// Set the config file path passed to `run_server`.
+    ///
+    /// Required for hot-reload tests: write a TOML config to this path before
+    /// building the harness, then call `POST /admin/api/v1/config/reload`
+    /// after modifying the file.
+    pub fn with_config_path(mut self, path: impl Into<String>) -> Self {
+        self.config_path = path.into();
+        self
+    }
+
     /// Configure the OpenAI pool with multiple named keys and a specific
     /// selector strategy (e.g. `"round_robin"`, `"weighted_random"`).
     ///
@@ -237,7 +252,7 @@ impl TestHarnessBuilder {
         );
 
         let (addr, admin_addr, shutdown) =
-            crate::server::start_test_server(config, self.admin_enabled).await;
+            crate::server::start_test_server(config, self.admin_enabled, self.config_path).await;
 
         let client = TestClient::new(addr, admin_addr);
 

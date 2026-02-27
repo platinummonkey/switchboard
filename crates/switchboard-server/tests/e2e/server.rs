@@ -17,6 +17,7 @@ use crate::port_allocator;
 pub async fn start_test_server(
     config: ServerConfig,
     admin_enabled: bool,
+    config_path: String,
 ) -> (
     SocketAddr,
     Option<SocketAddr>,
@@ -44,7 +45,7 @@ pub async fn start_test_server(
     let server_handle = tokio::spawn(async move {
         switchboard_server::run_server(
             config,
-            "", // config_path: no file-based hot-reload in tests
+            &config_path,
             proxy_listener,
             admin_listener,
             async move {

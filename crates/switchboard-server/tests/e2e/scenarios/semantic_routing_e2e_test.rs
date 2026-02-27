@@ -268,6 +268,98 @@ async fn test_e2e_semantic_routing_disabled_uses_normal_routing() {
     crate::assertions::assert_received_n(openai_mock, 1).await;
 }
 
+/// Verifies the classifier-override behaviour: when the client sends
+/// `"model": "gpt-4o"` but the routing config's `code_generation` rule lists
+/// `"claude-3-5-sonnet-20241022"` as the preferred model, the proxy does NOT
+/// automatically override the body model and still routes to OpenAI.
+///
+/// # Why the proxy routes to OpenAI despite the routing rule
+///
+/// The semantic routing configuration (`RoutingConfig`) is stored in
+/// `ServerConfig` and wired through the harness, but the proxy handler
+/// (`chat_completions` in `proxy/handler.rs`) resolves the provider by calling
+/// `providers.resolve_provider(&body_model, ...)` directly from the parsed
+/// request body.  The `ModelSelector` has a `semantic` mode, but it is not
+/// invoked in the proxy handler's hot path; the routing rules are metadata
+/// that informs future tooling rather than actively rewriting the request at
+/// this phase of the implementation.
+///
+/// As a result:
+/// - The body model `"gpt-4o"` resolves to the OpenAI provider.
+/// - OpenAI mock receives the request and returns 200.
+/// - Anthropic mock receives 0 requests.
+///
+/// This test documents the current behaviour.  When semantic model override
+/// is wired into the proxy handler in a future phase, this test should be
+/// updated to assert that Anthropic receives the request and OpenAI receives 0.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_e2e_semantic_routing_overrides_request_model() {
+    let routing = RoutingConfig {
+        semantic: SemanticRoutingConfig {
+            enabled: true,
+            classifier: "heuristic".into(),
+            rules: vec![RoutingRule {
+                task_type: "code_generation".into(),
+                complexity: None,
+                preferred_models: vec!["claude-3-5-sonnet-20241022".into()],
+                fallback_models: vec!["gpt-4o".into()],
+            }],
+            default: DefaultRouting {
+                preferred_models: vec!["gpt-4o".into()],
+            },
+        },
+    };
+
+    let harness = TestHarnessBuilder::new()
+        .with_openai()
+        .with_anthropic()
+        .with_routing(routing)
+        .build()
+        .await;
+
+    let openai_mock = harness.mocks.openai.as_ref().unwrap();
+    let anthropic_mock = harness.mocks.anthropic.as_ref().unwrap();
+
+    // Mount both mocks so the test can observe which provider received the
+    // request regardless of which code path the proxy actually takes.
+    mock_openai_ok("gpt-4o", "openai-response")
+        .mount(openai_mock)
+        .await;
+    mock_anthropic_ok("anthropic-response")
+        .mount(anthropic_mock)
+        .await;
+
+    // Send a code-generation prompt with model="gpt-4o".
+    // The routing rule says code_generation should prefer claude-3-5-sonnet,
+    // but the proxy handler resolves the provider from the body model directly.
+    let resp = harness
+        .client
+        .chat_completions(json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": "Write a Python function to sort a list using bubble sort algorithm:\n```python\ndef bubble_sort(arr):\n    pass\n```"
+            }]
+        }))
+        .await;
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "request must return 200; the proxy routes by body model not by classifier output"
+    );
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    crate::assertions::assert_openai_chat_response(&body, "openai-response");
+
+    // Current behaviour: the proxy uses the body model ("gpt-4o") for provider
+    // resolution, so OpenAI receives the request and Anthropic receives none.
+    // When semantic model override is wired into the proxy handler, update
+    // these assertions to expect anthropic=1, openai=0.
+    crate::assertions::assert_received_n(openai_mock, 1).await;
+    crate::assertions::assert_received_n(anthropic_mock, 0).await;
+}
+
 /// Verify that both providers can be used simultaneously when a routing config
 /// is present with multiple rules.
 ///

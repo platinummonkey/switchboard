@@ -412,8 +412,10 @@ pub async fn run_server(
     }
 
     // Build guardrail pipeline from config (if enabled).
+    // Use the async variant so that gRPC callout engines (which require an
+    // async connection step) are handled correctly alongside builtin types.
     let guardrail_pipeline = if guardrails_config.enabled {
-        match GuardrailPipeline::from_config(&guardrails_config) {
+        match GuardrailPipeline::from_config_async(&guardrails_config).await {
             Ok(pipeline) => {
                 tracing::info!("guardrail pipeline enabled");
                 Some(Arc::new(pipeline))
@@ -445,18 +447,30 @@ pub async fn run_server(
 
     let (stack, _stack_handle) = build_middleware_stack(middleware_cfg);
 
-    let mut router = Router::new()
+    // Build the LLM proxy sub-router.  This is the only set of routes that
+    // should be evaluated by the guardrail pipeline — the `/health` endpoint
+    // must stay outside the guardrail layer so health checks are never blocked
+    // by a guardrail returning a non-Pass verdict.
+    let proxy_router = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/api/v1/messages", post(anthropic_messages))
-        .route("/v1/models", get(list_models))
+        .route("/v1/models", get(list_models));
+
+    // Apply guardrail layer only to the proxy routes.
+    let proxy_router: Router<Arc<AppState>> = if let Some(pipeline) = guardrail_pipeline {
+        tracing::info!("guardrail layer applied to proxy routes");
+        proxy_router.layer(GuardrailLayer::new(pipeline))
+    } else {
+        proxy_router
+    };
+
+    // Assemble the full router: proxy routes (with optional guardrails) +
+    // health check (always unguarded). Apply shared AppState after merging so
+    // both sub-routers receive the same state instance.
+    let router = Router::new()
+        .merge(proxy_router)
         .route("/health", get(health))
         .with_state(app_state);
-
-    // Apply guardrail layer closest to the handler (before middleware stack).
-    if let Some(pipeline) = guardrail_pipeline {
-        router = router.layer(GuardrailLayer::new(pipeline));
-        tracing::info!("guardrail layer applied to router");
-    }
 
     // Apply the middleware stack (outermost layers).
     let router = router.layer(stack);
