@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use http::{HeaderName, HeaderValue};
-use tokio::sync::RwLock;
+use std::sync::RwLock;
 
 use switchboard_server::auth::{AuthProvider, UpstreamAuthError, UpstreamCredentials};
 use switchboard_server::key_pool::provider::PooledKey;
@@ -241,7 +241,7 @@ async fn test_refresh_task_updates_credentials_before_expiry() {
         "provider.refresh() should have been called at least once"
     );
 
-    let guard = key.read().await;
+    let guard = key.read().unwrap();
     let val = guard.credentials.header_value.to_str().unwrap();
     assert_eq!(
         val, "Bearer new-cred",
@@ -273,7 +273,7 @@ async fn test_refresh_task_does_not_refresh_static_key() {
     );
 
     // Credentials must remain unchanged.
-    let guard = key.read().await;
+    let guard = key.read().unwrap();
     let val = guard.credentials.header_value.to_str().unwrap();
     assert_eq!(val, "Bearer static");
 }
@@ -311,7 +311,7 @@ async fn test_refresh_task_retries_on_failure() {
         "provider should have succeeded at least once after retrying"
     );
 
-    let guard = key.read().await;
+    let guard = key.read().unwrap();
     let val = guard.credentials.header_value.to_str().unwrap();
     assert_eq!(
         val, "Bearer refreshed-cred",
@@ -349,7 +349,7 @@ async fn test_refresh_task_leaves_credentials_unchanged_on_persistent_failure() 
     );
 
     // The original credentials must be unchanged.
-    let guard = key.read().await;
+    let guard = key.read().unwrap();
     let val = guard.credentials.header_value.to_str().unwrap();
     assert_eq!(
         val, "Bearer original",
@@ -399,13 +399,13 @@ async fn test_two_concurrent_refresh_tasks_are_independent() {
         "key_b should have been refreshed"
     );
 
-    let guard_a = key_a.read().await;
+    let guard_a = key_a.read().unwrap();
     assert_eq!(
         guard_a.credentials.header_value.to_str().unwrap(),
         "Bearer new-a"
     );
 
-    let guard_b = key_b.read().await;
+    let guard_b = key_b.read().unwrap();
     assert_eq!(
         guard_b.credentials.header_value.to_str().unwrap(),
         "Bearer new-b"
@@ -442,7 +442,7 @@ async fn test_refresh_task_fires_immediately_when_already_past_refresh_deadline(
         "refresh should fire immediately when already past the refresh deadline"
     );
 
-    let guard = key.read().await;
+    let guard = key.read().unwrap();
     assert_eq!(
         guard.credentials.header_value.to_str().unwrap(),
         "Bearer immediate-new"

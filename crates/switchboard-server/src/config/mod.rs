@@ -49,6 +49,21 @@ fn default_jwt_claim() -> String {
     "email".into()
 }
 
+/// A single API-key to user-identity mapping entry.
+///
+/// Used by ApiKeyMappingResolver to translate a raw API key value into a
+/// known user identity without requiring JWT tokens.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ApiKeyMapping {
+    /// The plaintext API key value (without the Bearer prefix).
+    pub api_key: String,
+    /// The user identity to inject when this key matches.
+    pub user_id: String,
+    /// Optional team identity propagated to the context.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IdentityConfig {
     /// Ordered list of resolver strategies to try.
@@ -62,6 +77,10 @@ pub struct IdentityConfig {
     /// JWT claim to extract as the user ID.
     #[serde(default = "default_jwt_claim")]
     pub jwt_claim: String,
+
+    /// Static API key to user identity mappings for ApiKeyMappingResolver.
+    #[serde(default)]
+    pub api_key_mappings: Vec<ApiKeyMapping>,
 }
 
 impl Default for IdentityConfig {
@@ -70,6 +89,7 @@ impl Default for IdentityConfig {
             resolvers: default_identity_resolvers(),
             header_name: default_identity_header(),
             jwt_claim: default_jwt_claim(),
+            api_key_mappings: Vec::new(),
         }
     }
 }

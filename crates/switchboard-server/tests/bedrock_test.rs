@@ -10,7 +10,7 @@
 //! - Bedrock credentials JSON format parsing
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue};
@@ -51,7 +51,10 @@ fn make_bedrock_key(region: &str) -> PooledKey {
 }
 
 fn make_pool(key: PooledKey) -> Arc<KeyPool> {
-    Arc::new(KeyPool::new(vec![key], Box::new(WeightedRandomSelector)))
+    Arc::new(KeyPool::new(
+        vec![Arc::new(RwLock::new(key))],
+        Box::new(WeightedRandomSelector),
+    ))
 }
 
 fn simple_user_request(model: &str) -> ProxiedRequest {

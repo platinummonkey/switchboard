@@ -20,7 +20,8 @@ expression: "&cfg"
       "api_key"
     ],
     "header_name": "x-switchboard-user",
-    "jwt_claim": "email"
+    "jwt_claim": "email",
+    "api_key_mappings": []
   },
   "auth": {
     "validators": {}

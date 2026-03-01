@@ -133,15 +133,16 @@ impl ProviderHealthChecker {
                     };
 
                     let ctx = switchboard_common::types::RequestContext::new();
-                    let Some(key) = pool.select(&ctx) else {
+                    let Some(key_arc) = pool.select(&ctx) else {
                         tracing::debug!(
                             provider = name,
                             "health check: no eligible key in pool, skipping"
                         );
                         continue;
                     };
-
-                    let result = provider.health_check(key).await;
+                    // Clone so we release the lock before .await.
+                    let key_snapshot = key_arc.read().unwrap().clone();
+                    let result = provider.health_check(&key_snapshot).await;
                     self.record(name, result);
                 }
             }

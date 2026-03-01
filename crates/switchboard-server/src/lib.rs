@@ -18,7 +18,7 @@ pub mod proxy;
 pub mod routing;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use anyhow::Result;
 use axum::Router;
@@ -47,6 +47,58 @@ use crate::providers::{
 use crate::proxy::handler::{AppState, anthropic_messages, chat_completions, health, list_models};
 use crate::routing::ProviderHealthChecker;
 use crate::routing::selector::ModelSelector;
+
+// ── Key provider AuthProvider adapters for spawn_refresh_task ─────────────────
+
+struct AwsStsAuthAdapter(AwsStsProvider);
+
+#[async_trait::async_trait]
+impl crate::auth::AuthProvider for AwsStsAuthAdapter {
+    fn name(&self) -> &str {
+        "aws_sts"
+    }
+    async fn get_credentials(
+        &self,
+    ) -> Result<crate::auth::UpstreamCredentials, crate::auth::UpstreamAuthError> {
+        self.0
+            .fetch()
+            .await
+            .map_err(|e| crate::auth::UpstreamAuthError::FetchFailed(e.to_string()))
+    }
+    async fn refresh(
+        &self,
+    ) -> Result<crate::auth::UpstreamCredentials, crate::auth::UpstreamAuthError> {
+        self.get_credentials().await
+    }
+    fn is_valid(&self) -> bool {
+        true
+    }
+}
+
+struct VaultAuthAdapter(crate::key_pool::VaultProvider);
+
+#[async_trait::async_trait]
+impl crate::auth::AuthProvider for VaultAuthAdapter {
+    fn name(&self) -> &str {
+        "vault"
+    }
+    async fn get_credentials(
+        &self,
+    ) -> Result<crate::auth::UpstreamCredentials, crate::auth::UpstreamAuthError> {
+        self.0
+            .fetch()
+            .await
+            .map_err(|e| crate::auth::UpstreamAuthError::FetchFailed(e.to_string()))
+    }
+    async fn refresh(
+        &self,
+    ) -> Result<crate::auth::UpstreamCredentials, crate::auth::UpstreamAuthError> {
+        self.get_credentials().await
+    }
+    fn is_valid(&self) -> bool {
+        true
+    }
+}
 
 /// Build an [`AuthRegistry`] from the server configuration.
 ///
@@ -151,7 +203,7 @@ pub async fn build_providers(
         }
 
         // Build the key pool for this provider.
-        let mut keys: Vec<PooledKey> = Vec::new();
+        let mut keys: Vec<Arc<RwLock<PooledKey>>> = Vec::new();
         for entry in &provider_cfg.key_pool.keys {
             match entry.key_type.as_str() {
                 "static" => {
@@ -177,7 +229,11 @@ pub async fn build_providers(
                         header_value,
                         expires_at: None,
                     };
-                    keys.push(PooledKey::new_static(&entry.id, creds, entry.weight));
+                    keys.push(Arc::new(RwLock::new(PooledKey::new_static(
+                        &entry.id,
+                        creds,
+                        entry.weight,
+                    ))));
                 }
                 "aws_sts" => {
                     let role_arn = match entry.role_arn.as_deref() {
@@ -203,7 +259,7 @@ pub async fn build_providers(
                                 role_arn = role_arn,
                                 "fetched initial STS credentials for key"
                             );
-                            keys.push(PooledKey {
+                            let key_arc = Arc::new(RwLock::new(PooledKey {
                                 id: entry.id.clone(),
                                 credentials: creds,
                                 weight: entry.weight,
@@ -211,7 +267,18 @@ pub async fn build_providers(
                                     role_arn: role_arn.to_string(),
                                 },
                                 health: crate::key_pool::KeyHealth::default(),
-                            });
+                            }));
+                            // Spawn proactive refresh for STS key.
+                            {
+                                let auth = Arc::new(AwsStsAuthAdapter(provider.clone()));
+                                crate::key_pool::spawn_refresh_task(
+                                    Arc::clone(&key_arc),
+                                    auth,
+                                    std::time::Duration::from_secs(30),
+                                );
+                                tracing::info!(key_id = %entry.id, "spawned STS refresh task");
+                            }
+                            keys.push(key_arc);
                         }
                         Err(e) => {
                             tracing::error!(
@@ -248,7 +315,7 @@ pub async fn build_providers(
                                     "fetched initial Vault credentials (no TTL)"
                                 );
                             }
-                            keys.push(PooledKey {
+                            let key_arc = Arc::new(RwLock::new(PooledKey {
                                 id: entry.id.clone(),
                                 credentials: creds,
                                 weight: entry.weight,
@@ -256,7 +323,18 @@ pub async fn build_providers(
                                     path: path.to_string(),
                                 },
                                 health: crate::key_pool::KeyHealth::default(),
-                            });
+                            }));
+                            // Spawn proactive refresh for Vault key.
+                            {
+                                let auth = Arc::new(VaultAuthAdapter(provider.clone()));
+                                crate::key_pool::spawn_refresh_task(
+                                    Arc::clone(&key_arc),
+                                    auth,
+                                    std::time::Duration::from_secs(30),
+                                );
+                                tracing::info!(key_id = %entry.id, "spawned Vault refresh task");
+                            }
+                            keys.push(key_arc);
                         }
                         Err(e) => {
                             tracing::error!(
@@ -280,7 +358,7 @@ pub async fn build_providers(
 
         let selector: Box<dyn KeySelector> = match provider_cfg.key_pool.selector.as_str() {
             "round_robin" => Box::new(RoundRobinSelector::new()),
-            "least_loaded" => Box::new(LeastLoadedSelector),
+            "least_loaded" => Box::new(LeastLoadedSelector::new()),
             "sticky" => Box::new(StickySelector::new(Box::new(RoundRobinSelector::new()))),
             _ => Box::new(WeightedRandomSelector),
         };
@@ -346,7 +424,14 @@ pub async fn run_server(
     let guardrails_config = config.guardrails.clone();
 
     // Build provider registry and key pools from config.
-    let (provider_registry, key_pools) = build_providers(&config).await;
+    let (mut provider_registry, key_pools) = build_providers(&config).await;
+
+    // Create the health checker early so it can be wired into both
+    // ProviderRegistry (for resolve_provider filtering) and AppState (for
+    // handler-level health checks). Must be created before registry is wrapped
+    // in Arc.
+    let health_checker = Arc::new(ProviderHealthChecker::new());
+    provider_registry.set_health_checker(Arc::clone(&health_checker));
 
     // Create a shared usage tracker — the same Arc is held by both AppState
     // (written by proxy handlers) and AdminState (read by admin API).
@@ -358,12 +443,16 @@ pub async fn run_server(
     let (rate_limit_layer, rate_limit_handle) =
         RateLimitLayer::new(default_rpm, default_tpm, rate_limit_overrides);
 
+    // Create health checker (stored in AppState for fail-open access in handlers).
+    let health_checker = Arc::new(ProviderHealthChecker::new());
+
     let app_state = Arc::new(AppState {
         config: Arc::new(config),
         providers: Arc::new(provider_registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::clone(&usage),
         rate_limit_handle: Some(rate_limit_handle.clone()),
+        health_checker: Arc::clone(&health_checker),
     });
 
     // Spawn the admin server if enabled.
@@ -416,20 +505,9 @@ pub async fn run_server(
 
     // Spawn background provider health checks.
     //
-    // The health checker probes each registered provider periodically and records
-    // healthy/unhealthy status for observability (tracing logs).  Health results
-    // do not yet influence routing decisions — that is a future improvement.
-    //
-    // TODO (Fix 4 / key refresh): Wiring `spawn_refresh_task` for STS/Vault keys
-    // requires `KeyPool` to store `Arc<RwLock<PooledKey>>` instead of owned
-    // `PooledKey` values.  The current `KeyPool::new(Vec<PooledKey>, …)` signature
-    // takes ownership; `spawn_refresh_task` needs a shared `Arc<RwLock<PooledKey>>`
-    // to write refreshed credentials back.  Steps required:
-    //   1. Change `KeyPool.keys` from `Vec<PooledKey>` to `Vec<Arc<RwLock<PooledKey>>>`.
-    //   2. Update `KeySelector::select` and all downstream selectors to dereference
-    //      the `Arc<RwLock>` when reading credentials.
-    //   3. In `build_providers`, wrap each STS/Vault key in `Arc<RwLock<…>>` and
-    //      call `spawn_refresh_task` before inserting into the pool.
+    // The health checker is the same Arc shared with ProviderRegistry and
+    // AppState, so health results immediately influence both routing decisions
+    // (resolve_provider filtering) and handler-level checks.
     {
         let health_interval = app_state
             .config
@@ -439,7 +517,6 @@ pub async fn run_server(
             .min()
             .unwrap_or(std::time::Duration::from_secs(30));
 
-        let health_checker = Arc::new(ProviderHealthChecker::new());
         Arc::clone(&health_checker).spawn_health_checks(
             Arc::clone(&app_state.providers),
             Arc::clone(&app_state.key_pools),

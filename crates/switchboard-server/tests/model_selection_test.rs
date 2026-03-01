@@ -5,7 +5,7 @@
 //! header overrides, and the `/v1/models` list endpoint all behave correctly.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -48,7 +48,10 @@ fn make_key(header_name: &'static str, header_value: &'static str) -> PooledKey 
 }
 
 fn make_pool(key: PooledKey) -> Arc<KeyPool> {
-    Arc::new(KeyPool::new(vec![key], Box::new(WeightedRandomSelector)))
+    Arc::new(KeyPool::new(
+        vec![Arc::new(RwLock::new(key))],
+        Box::new(WeightedRandomSelector),
+    ))
 }
 
 fn build_test_router(state: Arc<AppState>) -> Router {
@@ -232,6 +235,9 @@ async fn test_mapping_mode_rewrites_model() {
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
         rate_limit_handle: None,
+        health_checker: std::sync::Arc::new(
+            switchboard_server::routing::ProviderHealthChecker::new(),
+        ),
     });
 
     let app = build_test_router(state);
@@ -327,6 +333,9 @@ async fn test_dynamic_mode_respects_header() {
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
         rate_limit_handle: None,
+        health_checker: std::sync::Arc::new(
+            switchboard_server::routing::ProviderHealthChecker::new(),
+        ),
     });
 
     let app = build_test_router(state);
@@ -400,6 +409,9 @@ async fn test_unknown_model_returns_400() {
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
         rate_limit_handle: None,
+        health_checker: std::sync::Arc::new(
+            switchboard_server::routing::ProviderHealthChecker::new(),
+        ),
     });
 
     let app = build_test_router(state);
@@ -471,6 +483,9 @@ async fn test_list_models_returns_configured_models() {
         key_pools: Arc::new(HashMap::new()),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
         rate_limit_handle: None,
+        health_checker: std::sync::Arc::new(
+            switchboard_server::routing::ProviderHealthChecker::new(),
+        ),
     });
 
     let app = build_test_router(state);

@@ -98,13 +98,11 @@ async fn test_e2e_model_selection_static_mode() {
 
 /// Mapping mode: the selector looks up `ctx.model` in the configured mappings.
 ///
-/// In the middleware layer, `ctx.model` is not populated from the request body
-/// (the body is not parsed at middleware level), so the mapping falls back to
-/// the configured fallback model.  The fallback is "gpt-4o", which is
-/// registered with the OpenAI provider, so the request succeeds.
-///
-/// The proxy handler still routes based on the body model, which must also be
-/// registered.  Here we use "gpt-4o" for both.
+/// `ModelOverrideLayer` now buffers the request body and extracts the `"model"`
+/// field, populating `ctx.model` before calling `selector.select()`.  The body
+/// model `"gpt-4o"` has no mapping entry (the mapping is `gpt-4 → gpt-4o`),
+/// so the selector falls through to the fallback `"gpt-4o"`.  The result is
+/// the same as before — the request succeeds with the fallback model.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_e2e_model_selection_mapping_mode() {
     let mut mappings = HashMap::new();
@@ -128,8 +126,7 @@ async fn test_e2e_model_selection_mapping_mode() {
 
     mock_chat_ok("gpt-4o", "mapped").mount(openai_mock).await;
 
-    // The body uses "gpt-4o" which is registered with the OpenAI provider.
-    // The mapping config is available for request-context-aware components.
+    // The body model "gpt-4o" has no mapping entry, so the fallback "gpt-4o" is used.
     let resp = harness
         .client
         .chat_completions(json!({
@@ -279,42 +276,35 @@ async fn test_e2e_model_selection_allowed_models_rejects_disallowed() {
 // entry for the request's `user_id` or `team`, it returns the overridden model
 // instead of honouring the client-supplied header or falling back.
 //
-// # Architectural constraint: middleware uses an empty RequestContext
+// # How per-user overrides now work end-to-end
 //
-// `ModelOverrideLayer` is the Tower middleware that calls `selector.select()`.
-// It builds a **minimal** `RequestContext::default()` — with no `user_id` —
-// because user identity is resolved later, inside the axum handler via
-// `build_request_context()`.  Consequently, the per-user/per-team branch of
-// `select_dynamic()` (steps 2 and 3) is never reached at the middleware layer.
-//
-// The only way to trigger a per-user override today is to supply an explicit
-// `x-switchboard-model` header (step 1 in `select_dynamic()`), which bypasses
-// user-identity lookup entirely.
+// `ModelOverrideLayer` buffers the request body and reads the `x-switchboard-user`
+// header to build a `RequestContext` with `user_id` populated BEFORE calling
+// `selector.select()`.  This means per-user overrides in `dynamic` mode fire
+// at the middleware layer (step 2 of `select_dynamic()`), not only inside the
+// handler.  The resolved model is stored in the `ResolvedModel` extension and
+// used by the handler to select the upstream provider and key pool.
 //
 // # Test strategy
 //
-// 1. Verify that configuring `overrides` does not break routing — the fallback
-//    is used and the upstream receives the expected model.
+// 1. Verify that without `x-switchboard-user` the fallback is used.
 // 2. Verify that the `x-switchboard-model` header takes precedence over every
-//    other consideration (including any override that would apply if identity
-//    were available at middleware time).
-// 3. Verify that multiple users with different overrides configured do not
-//    interfere with each other.
-// 4. Inspect the raw upstream request body to confirm the model forwarded is
-//    the body model ("gpt-4o"), not the override model ("gpt-3.5-turbo").
+//    other consideration (step 1 fires before step 2).
+// 3. Verify that multiple users with different overrides co-exist.
+// 4. Confirm the body model forwarded to upstream is unchanged (the middleware
+//    resolves the provider but does not rewrite the request body model field).
 
-/// Per-user override defined in config: because the middleware uses an empty
-/// `RequestContext`, the `user_id` branch in `select_dynamic()` is never
-/// reached.  The selector falls through to the configured `fallback` model.
+/// Per-user override defined in config: when no `x-switchboard-user` header is
+/// present the middleware cannot populate `ctx.user_id`, so the per-user override
+/// branch in `select_dynamic()` is never reached.  The selector falls through
+/// to the configured `fallback` model.
 ///
-/// This test verifies that the presence of `overrides` entries does not prevent
-/// successful routing and that the fallback is applied as expected.
+/// This test verifies that without the user header the fallback is applied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_e2e_per_user_model_override_uses_fallback_without_header() {
     // Configure a per-user override for "alice" → "gpt-3.5-turbo".
-    // The middleware always sees RequestContext::default() (no user_id), so the
-    // per-user override is never applied.  The selector falls through to the
-    // fallback "gpt-4o".
+    // No x-switchboard-user header is sent, so ctx.user_id remains None and
+    // the per-user override is never applied.  The selector uses the fallback.
     let mut overrides = HashMap::new();
     overrides.insert("alice".to_string(), "gpt-3.5-turbo".to_string());
 
@@ -333,14 +323,13 @@ async fn test_e2e_per_user_model_override_uses_fallback_without_header() {
 
     let openai_mock = harness.mocks.openai.as_ref().unwrap();
 
-    // Mount "gpt-4o" — the fallback that the middleware will actually select.
+    // Mount "gpt-4o" — the fallback that applies when no user header is sent.
     mock_chat_ok("gpt-4o", "fallback-response")
         .mount(openai_mock)
         .await;
 
     // Send without x-switchboard-model and without x-switchboard-user.
-    // The middleware cannot see any user_id so the per-user override for
-    // "alice" is not applied; the fallback "gpt-4o" is used.
+    // No user_id is available to the middleware so the fallback "gpt-4o" is used.
     let resp = harness
         .client
         .chat_completions(json!({
@@ -426,9 +415,10 @@ async fn test_e2e_per_user_model_override_header_takes_precedence_over_override(
 
 /// Multiple per-user overrides co-exist in the config without interfering.
 ///
-/// Configuring overrides for several users must not prevent requests from
-/// succeeding.  Because the middleware always uses an empty RequestContext, all
-/// requests still use the fallback model.
+/// Sends `x-switchboard-user` for alice, bob, and carol who all have overrides
+/// pointing to "gpt-3.5-turbo".  The middleware applies each per-user override.
+/// The OpenAI wiremock accepts any POST to `/v1/chat/completions` regardless of
+/// the body model, so all requests return 200.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_e2e_per_user_model_override_multiple_overrides_coexist() {
     let mut overrides = HashMap::new();
@@ -451,7 +441,7 @@ async fn test_e2e_per_user_model_override_multiple_overrides_coexist() {
 
     let openai_mock = harness.mocks.openai.as_ref().unwrap();
 
-    // All requests use the fallback "gpt-4o" (middleware has no user_id).
+    // The wiremock matches any POST body, so overriding to gpt-3.5-turbo still succeeds.
     mock_chat_ok("gpt-4o", "coexist-ok")
         .mount(openai_mock)
         .await;
@@ -477,17 +467,21 @@ async fn test_e2e_per_user_model_override_multiple_overrides_coexist() {
     crate::assertions::assert_received_n(openai_mock, 3).await;
 }
 
-/// Inspect the raw upstream request body to confirm the model forwarded is
-/// the body model "gpt-4o", not the override model "gpt-3.5-turbo".
+/// Inspect the raw upstream request body to confirm the model field forwarded
+/// to the upstream is the ORIGINAL body model `"gpt-4o"`, not the override
+/// model `"gpt-3.5-turbo"`.
 ///
-/// Because `ModelOverrideLayer` uses `RequestContext::default()`, the per-user
-/// override for "alice" → "gpt-3.5-turbo" is never applied.  The proxy handler
-/// routes by the body model ("gpt-4o") which is registered with the OpenAI
-/// provider.  The upstream therefore receives `"model": "gpt-4o"`.
+/// When the middleware resolves alice's per-user override to `"gpt-3.5-turbo"`,
+/// it selects the OpenAI provider and key pool (both `gpt-4o` and `gpt-3.5-turbo`
+/// are registered with OpenAI in the test config).  The proxy handler does NOT
+/// rewrite the request body — it forwards the original body unchanged.  The
+/// upstream therefore still receives `"model": "gpt-4o"`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_e2e_per_user_model_override_upstream_receives_fallback_model() {
     let mut overrides = HashMap::new();
-    // Configure an override; it must NOT fire at the middleware layer.
+    // Configure a per-user override for "alice" → "gpt-3.5-turbo".
+    // The middleware will select "gpt-3.5-turbo" as the provider routing key,
+    // but the request body model ("gpt-4o") is forwarded unchanged.
     overrides.insert("alice".to_string(), "gpt-3.5-turbo".to_string());
 
     let cfg = ModelSelectionConfig {
@@ -542,8 +536,9 @@ async fn test_e2e_per_user_model_override_upstream_receives_fallback_model() {
     let upstream_body: serde_json::Value =
         serde_json::from_slice(&reqs[0].body).expect("upstream body must be valid JSON");
 
-    // The body model forwarded to upstream is "gpt-4o", NOT "gpt-3.5-turbo",
-    // confirming the override was not applied at the middleware level.
+    // The body model forwarded to upstream is "gpt-4o", NOT "gpt-3.5-turbo".
+    // The middleware selects the provider using the resolved model but does not
+    // rewrite the request body.
     assert_eq!(
         upstream_body["model"], "gpt-4o",
         "upstream must receive body model 'gpt-4o', not the override 'gpt-3.5-turbo': got {:?}",

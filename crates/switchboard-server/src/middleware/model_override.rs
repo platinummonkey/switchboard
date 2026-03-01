@@ -9,13 +9,17 @@
 //!
 //! # Body-peeking strategy
 //!
-//! Reading the request body in Tower middleware would consume the `Body` stream
-//! before the axum handler can read it.  To avoid that problem, the layer reads
-//! the model name from the **`x-switchboard-model` header** (injected by
-//! `switchboard-local` or sent directly by callers).  If no explicit override
-//! header is present, it falls back to calling `selector.select(&ctx)` with a
-//! minimal [`RequestContext`] so the configured policy (static, mapping,
-//! dynamic, fallback) applies.
+//! The layer buffers the request body (up to 1 MiB) to extract the `"model"`
+//! field from the JSON payload.  This enables `mapping` mode to fire on the
+//! body model when no `x-switchboard-model` header is present.  The buffered
+//! bytes are re-attached to the request so the downstream handler can read the
+//! body as usual.
+//!
+//! Priority order:
+//! 1. `x-switchboard-model` header — explicit client override (no body parse).
+//! 2. `selector.select(&ctx)` where `ctx.model` comes from the JSON body and
+//!    `ctx.user_id` comes from the `x-switchboard-user` header — enables both
+//!    `mapping` mode and per-user `dynamic` overrides.
 //!
 //! # Extensions set
 //!
@@ -34,10 +38,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use axum::body::Body;
+use bytes::Bytes;
 use http::{Request, Response};
 use tower::{Layer, Service};
 
-use switchboard_common::protocol::HEADER_MODEL;
+use switchboard_common::protocol::{HEADER_MODEL, HEADER_USER};
 use switchboard_common::types::RequestContext;
 
 use crate::config::provider::ProvidersConfig;
@@ -151,37 +156,84 @@ where
         Box::pin(async move {
             // Step 1: determine the model name.
             //
-            // Priority order:
-            //   (a) `x-switchboard-model` header — explicit client override
-            //   (b) `selector.select()` — applies configured policy (static /
-            //       mapping / dynamic / fallback)
-            let (resolved_model, reason) = if let Some(header_model) = req
-                .headers()
+            // Split the request into parts so we can take ownership of the
+            // body while still reading the headers.
+            let (parts, body) = req.into_parts();
+
+            let (resolved_model, reason, body_bytes) = if let Some(header_model) = parts
+                .headers
                 .get(HEADER_MODEL)
                 .and_then(|v| v.to_str().ok())
             {
+                // Header takes precedence — skip body parsing entirely.
+                let header_model = header_model.to_owned();
                 tracing::debug!(
-                    model = header_model,
+                    model = %header_model,
                     "model_override: model from x-switchboard-model header"
                 );
-                (header_model.to_owned(), SelectionReason::HeaderOverride)
+                let bytes = axum::body::to_bytes(body, usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                (header_model, SelectionReason::HeaderOverride, bytes)
             } else {
-                // Build a minimal RequestContext; full user context is not
-                // yet available at this layer (AuthLayer runs after us in
-                // the stack ordering described in mod.rs, but in practice
-                // ModelOverrideLayer is outermost after RequestIdLayer so
-                // ValidatedClient may not be set yet).
-                let ctx = RequestContext::default();
+                // Buffer the body so we can read the JSON "model" field.
+                // Cap at 1 MiB to guard against enormous payloads; if the
+                // read fails we fall through with no body model (graceful
+                // degradation: selector still applies static/fallback policy).
+                const MAX_PEEK_BYTES: usize = 1024 * 1024;
+                let body_bytes: Bytes = match axum::body::to_bytes(body, MAX_PEEK_BYTES).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "model_override: failed to buffer body, using empty context"
+                        );
+                        Bytes::new()
+                    }
+                };
+
+                // Parse the JSON "model" field from the buffered bytes.
+                let body_model: Option<String> =
+                    serde_json::from_slice::<serde_json::Value>(&body_bytes)
+                        .ok()
+                        .and_then(|v| v["model"].as_str().map(|s| s.to_string()));
+
+                // Extract user identity from the x-switchboard-user header
+                // so that per-user overrides in `dynamic` mode can fire.
+                let user_id: Option<String> = parts
+                    .headers
+                    .get(HEADER_USER)
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+
+                // Build a RequestContext enriched with what we know at this
+                // point (body model + user_id from header).
+                let mut ctx = RequestContext::new();
+                if let Some(ref m) = body_model {
+                    ctx.model = Some(m.clone());
+                }
+                if let Some(ref u) = user_id {
+                    ctx.user_id = Some(u.clone());
+                }
+
                 let (model, reason) = selector.select(&ctx);
                 tracing::debug!(
                     model = %model,
                     reason = %reason,
+                    body_model = ?body_model,
+                    user_id = ?user_id,
                     "model_override: model from selector policy"
                 );
-                (model, reason)
+
+                (model, reason, body_bytes)
             };
 
-            // Step 2: resolve the provider for the model.
+            // Step 2: reconstruct the request from parts + buffered body bytes
+            // so the downstream handler can read the body as usual.
+            let mut req = Request::from_parts(parts, Body::from(body_bytes));
+
+            // Step 3: resolve the provider for the model.
             //
             // If the registry has no provider for this model we skip setting
             // extensions; the downstream handler will detect the missing
@@ -196,7 +248,6 @@ where
                         "model_override: resolved provider"
                     );
 
-                    let mut req = req;
                     req.extensions_mut().insert(ResolvedModel(model));
                     req.extensions_mut().insert(ProviderName(provider_name));
                     req.extensions_mut().insert(SelectionReasonExt(reason));
@@ -227,6 +278,7 @@ mod tests {
 
     use axum::body::Body;
     use http::{Request, Response, StatusCode};
+    use serde_json::json;
     use tower::{Layer, Service, ServiceExt};
 
     use super::*;
@@ -242,6 +294,27 @@ mod tests {
             mode: "static".into(),
             model: Some(model.to_string()),
             fallback: Some(model.to_string()),
+            ..ModelSelectionConfig::default()
+        }))
+    }
+
+    fn mapping_selector(mappings: HashMap<String, String>, fallback: &str) -> Arc<ModelSelector> {
+        Arc::new(ModelSelector::new(ModelSelectionConfig {
+            mode: "mapping".into(),
+            mappings,
+            fallback: Some(fallback.to_string()),
+            ..ModelSelectionConfig::default()
+        }))
+    }
+
+    fn dynamic_selector_with_overrides(
+        overrides: HashMap<String, String>,
+        fallback: &str,
+    ) -> Arc<ModelSelector> {
+        Arc::new(ModelSelector::new(ModelSelectionConfig {
+            mode: "dynamic".into(),
+            overrides,
+            fallback: Some(fallback.to_string()),
             ..ModelSelectionConfig::default()
         }))
     }
@@ -422,6 +495,86 @@ mod tests {
         let resolved = guard.as_ref().unwrap().as_ref();
         assert!(resolved.is_some(), "ResolvedModel should be set");
         assert_eq!(resolved.unwrap().0, "claude-sonnet-4-20250514");
+    }
+
+    // ── Tests: body-peeking for mapping mode ──────────────────────────────────
+
+    #[tokio::test]
+    async fn test_mapping_mode_fires_on_body_model() {
+        // Configure mapping: gpt-4 → gpt-4o
+        let mut mappings = HashMap::new();
+        mappings.insert("gpt-4".to_string(), "gpt-4o".to_string());
+        let selector = mapping_selector(mappings, "gpt-4o");
+        let registry = registry_with_openai(vec!["gpt-4".to_string(), "gpt-4o".to_string()]);
+        let config =
+            providers_config_with("openai", vec!["gpt-4".to_string(), "gpt-4o".to_string()]);
+
+        let (svc, rm, _pn) = CaptureSvc::new();
+        let layer = ModelOverrideLayer::new(selector, registry, config);
+        let mut wrapped = layer.layer(svc);
+
+        // Send a request with "model": "gpt-4" in the body; no header.
+        let body = serde_json::to_vec(&json!({"model": "gpt-4", "messages": []})).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        wrapped.ready().await.unwrap();
+        wrapped.call(req).await.unwrap();
+
+        let guard = rm.lock().unwrap();
+        let resolved = guard.as_ref().unwrap().as_ref();
+        assert!(resolved.is_some(), "ResolvedModel should be set");
+        // Mapping fires: gpt-4 → gpt-4o
+        assert_eq!(
+            resolved.unwrap().0,
+            "gpt-4o",
+            "mapping mode must fire on body model"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_body_peeking_per_user_override_fires() {
+        // Configure dynamic mode with a per-user override for "alice" → "gpt-3.5-turbo"
+        let mut overrides = HashMap::new();
+        overrides.insert("alice".to_string(), "gpt-3.5-turbo".to_string());
+        let selector = dynamic_selector_with_overrides(overrides, "gpt-4o");
+        let registry =
+            registry_with_openai(vec!["gpt-4o".to_string(), "gpt-3.5-turbo".to_string()]);
+        let config = providers_config_with(
+            "openai",
+            vec!["gpt-4o".to_string(), "gpt-3.5-turbo".to_string()],
+        );
+
+        let (svc, rm, _pn) = CaptureSvc::new();
+        let layer = ModelOverrideLayer::new(selector, registry, config);
+        let mut wrapped = layer.layer(svc);
+
+        // Send a request as "alice" with no x-switchboard-model header.
+        let body = serde_json::to_vec(&json!({"model": "gpt-4o", "messages": []})).unwrap();
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header(HEADER_USER, "alice")
+            .body(Body::from(body))
+            .unwrap();
+
+        wrapped.ready().await.unwrap();
+        wrapped.call(req).await.unwrap();
+
+        let guard = rm.lock().unwrap();
+        let resolved = guard.as_ref().unwrap().as_ref();
+        assert!(resolved.is_some(), "ResolvedModel should be set");
+        // Per-user override fires: alice → gpt-3.5-turbo
+        assert_eq!(
+            resolved.unwrap().0,
+            "gpt-3.5-turbo",
+            "per-user override must fire when x-switchboard-user header is present"
+        );
     }
 
     // ── Tests: provider name resolution ───────────────────────────────────────

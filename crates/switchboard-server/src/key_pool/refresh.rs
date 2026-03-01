@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::RwLock;
+use std::sync::RwLock;
 use tokio::task::JoinHandle;
 
 use crate::auth::AuthProvider;
@@ -70,7 +70,7 @@ pub fn spawn_refresh_task(
         loop {
             // Determine when the current credentials expire.
             let expires_at = {
-                let guard = key.read().await;
+                let guard = key.read().unwrap();
                 guard.credentials.expires_at
             };
 
@@ -108,7 +108,7 @@ pub fn spawn_refresh_task(
             loop {
                 match provider.refresh().await {
                     Ok(new_creds) => {
-                        let mut guard = key.write().await;
+                        let mut guard = key.write().unwrap();
                         tracing::info!(
                             provider = provider.name(),
                             key_id = guard.id,
@@ -142,7 +142,7 @@ mod tests {
 
     use async_trait::async_trait;
     use http::{HeaderName, HeaderValue};
-    use tokio::sync::RwLock;
+    use std::sync::RwLock;
 
     use super::*;
     use crate::auth::{AuthProvider, UpstreamAuthError, UpstreamCredentials};
@@ -258,7 +258,7 @@ mod tests {
         );
 
         // Credentials should be updated.
-        let guard = key.read().await;
+        let guard = key.read().unwrap();
         let val = guard.credentials.header_value.to_str().unwrap();
         assert_eq!(val, "Bearer new-cred");
     }
@@ -293,7 +293,7 @@ mod tests {
 
         // The key's credentials should still be the original ones (refresh
         // never succeeded).
-        let guard = key.read().await;
+        let guard = key.read().unwrap();
         let val = guard.credentials.header_value.to_str().unwrap();
         assert_eq!(val, "Bearer old-cred");
     }

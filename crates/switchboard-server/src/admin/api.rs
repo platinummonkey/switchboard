@@ -113,15 +113,18 @@ pub async fn list_provider_keys(
     let keys: Vec<KeySummary> = guard
         .keys
         .iter()
-        .map(|k| KeySummary {
-            id: k.id.clone(),
-            weight: k.weight,
-            source: k.source.to_string(),
-            status: k.health.status.to_string(),
-            total_requests: k.health.total_requests,
-            errors_last_5m: k.health.errors_last_5m,
-            rate_limit_hits_last_5m: k.health.rate_limit_hits_last_5m,
-            avg_latency_ms: k.health.avg_latency_ms,
+        .map(|k| {
+            let k = k.read().unwrap();
+            KeySummary {
+                id: k.id.clone(),
+                weight: k.weight,
+                source: k.source.to_string(),
+                status: k.health.status.to_string(),
+                total_requests: k.health.total_requests,
+                errors_last_5m: k.health.errors_last_5m,
+                rate_limit_hits_last_5m: k.health.rate_limit_hits_last_5m,
+                avg_latency_ms: k.health.avg_latency_ms,
+            }
         })
         .collect();
     drop(guard);
@@ -260,25 +263,16 @@ pub async fn update_provider_key(
         );
     };
 
-    let mut pool_guard = pool.write().unwrap();
-    let Some(key) = pool_guard.get_key_mut(&key_id) else {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": "key not found"})),
-        );
-    };
-
-    if let Some(weight) = update.weight {
-        key.weight = weight;
-    }
-
+    // Validate status before locking the key.
     if let Some(status_str) = &update.status {
         use crate::key_pool::KeyStatus;
-        key.health.status = match status_str.as_str() {
-            "healthy" => KeyStatus::Healthy,
-            "degraded" => KeyStatus::Degraded,
-            "rate_limited" => KeyStatus::RateLimited,
-            "disabled" => KeyStatus::Disabled,
+        let _: KeyStatus = match status_str.as_str() {
+            "healthy" | "degraded" | "rate_limited" | "disabled" => match status_str.as_str() {
+                "healthy" => KeyStatus::Healthy,
+                "degraded" => KeyStatus::Degraded,
+                "rate_limited" => KeyStatus::RateLimited,
+                _ => KeyStatus::Disabled,
+            },
             other => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -287,7 +281,29 @@ pub async fn update_provider_key(
             }
         };
     }
+    let pool_guard = pool.read().unwrap();
+    let Some(key_arc) = pool_guard.get_key(&key_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "key not found"})),
+        );
+    };
     drop(pool_guard);
+    {
+        let mut key = key_arc.write().unwrap();
+        if let Some(weight) = update.weight {
+            key.weight = weight;
+        }
+        if let Some(status_str) = &update.status {
+            use crate::key_pool::KeyStatus;
+            key.health.status = match status_str.as_str() {
+                "healthy" => KeyStatus::Healthy,
+                "degraded" => KeyStatus::Degraded,
+                "rate_limited" => KeyStatus::RateLimited,
+                _ => KeyStatus::Disabled,
+            };
+        }
+    }
 
     // Update the config weight if provided.
     if let Some(weight) = update.weight {
@@ -325,12 +341,13 @@ pub async fn get_key_health(
     };
 
     let guard = pool.read().unwrap();
-    let Some(key) = guard.keys.iter().find(|k| k.id == key_id) else {
+    let Some(key_arc) = guard.keys.iter().find(|k| k.read().unwrap().id == key_id) else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "key not found"})),
         );
     };
+    let key = key_arc.read().unwrap();
 
     let last_used_secs = key.health.last_used.map(|t| t.elapsed().as_secs_f64());
     let last_error = key.health.last_error.as_ref().map(|(_, msg)| msg.clone());

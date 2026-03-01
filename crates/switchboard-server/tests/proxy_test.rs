@@ -5,7 +5,7 @@
 //! requests through the full handler stack.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -49,7 +49,10 @@ fn make_key(header_name: &'static str, header_value: &'static str) -> PooledKey 
 }
 
 fn make_pool(key: PooledKey) -> Arc<KeyPool> {
-    Arc::new(KeyPool::new(vec![key], Box::new(WeightedRandomSelector)))
+    Arc::new(KeyPool::new(
+        vec![Arc::new(RwLock::new(key))],
+        Box::new(WeightedRandomSelector),
+    ))
 }
 
 /// Build an `AppState` pointing OpenAI at the given mock server URL.
@@ -93,6 +96,9 @@ fn openai_app_state(mock_url: &str) -> Arc<AppState> {
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
         rate_limit_handle: None,
+        health_checker: std::sync::Arc::new(
+            switchboard_server::routing::ProviderHealthChecker::new(),
+        ),
     })
 }
 
@@ -142,6 +148,9 @@ fn anthropic_app_state(mock_url: &str) -> Arc<AppState> {
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
         rate_limit_handle: None,
+        health_checker: std::sync::Arc::new(
+            switchboard_server::routing::ProviderHealthChecker::new(),
+        ),
     })
 }
 
@@ -320,6 +329,9 @@ async fn test_health_endpoint() {
         key_pools: Arc::new(HashMap::new()),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
         rate_limit_handle: None,
+        health_checker: std::sync::Arc::new(
+            switchboard_server::routing::ProviderHealthChecker::new(),
+        ),
     });
     let app = build_test_router(state);
 
@@ -488,6 +500,9 @@ async fn test_no_key_pool_returns_503() {
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
         rate_limit_handle: None,
+        health_checker: std::sync::Arc::new(
+            switchboard_server::routing::ProviderHealthChecker::new(),
+        ),
     });
 
     let app = build_test_router(state);
@@ -552,6 +567,9 @@ fn vertex_app_state(mock_url: &str) -> Arc<AppState> {
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
         rate_limit_handle: None,
+        health_checker: std::sync::Arc::new(
+            switchboard_server::routing::ProviderHealthChecker::new(),
+        ),
     })
 }
 
@@ -595,6 +613,9 @@ fn ollama_app_state(mock_url: &str) -> Arc<AppState> {
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
         rate_limit_handle: None,
+        health_checker: std::sync::Arc::new(
+            switchboard_server::routing::ProviderHealthChecker::new(),
+        ),
     })
 }
 
@@ -667,6 +688,9 @@ async fn test_bedrock_non_streaming() {
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
         rate_limit_handle: None,
+        health_checker: std::sync::Arc::new(
+            switchboard_server::routing::ProviderHealthChecker::new(),
+        ),
     });
 
     // Verify that the BedrockProvider is correctly registered and resolves the

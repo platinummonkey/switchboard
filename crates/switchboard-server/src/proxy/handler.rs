@@ -22,7 +22,10 @@ use switchboard_common::types::RequestContext;
 use crate::auth::ValidatedClient;
 use crate::config::IdentityConfig;
 use crate::config::ServerConfig;
-use crate::identity::{HeaderResolver, IdentityChain, JwtClaimResolver, ToolSpecificResolver};
+use crate::identity::{
+    ApiKeyMappingResolver, HeaderResolver, IdentityChain, IdentitySource, JwtClaimResolver,
+    ToolSpecificResolver, UserIdentity,
+};
 use crate::key_pool::KeyPool;
 use crate::middleware::model_override::ResolvedModel;
 use crate::observability::UsageTracker;
@@ -31,6 +34,7 @@ use crate::proxy::error::ProxyError;
 use crate::proxy::transform::{
     anthropic_to_proxied, openai_to_proxied, proxied_to_anthropic, proxied_to_openai,
 };
+use crate::routing::ProviderHealthChecker;
 
 // ── AppState ──────────────────────────────────────────────────────────────────
 
@@ -48,15 +52,12 @@ pub struct AppState {
     /// Rate-limit handle for recording token usage post-response.
     /// `None` when rate limiting is disabled.
     pub rate_limit_handle: Option<crate::middleware::RateLimitHandle>,
+    pub health_checker: Arc<ProviderHealthChecker>,
 }
 
 // ── Route handlers ────────────────────────────────────────────────────────────
 
-/// `POST /v1/chat/completions` — OpenAI-compatible chat completions.
-///
-/// Parses the body as an OpenAI chat completion request, routes to the
-/// appropriate upstream provider, and returns the response in OpenAI format.
-/// If `stream: true` the response is forwarded as raw SSE.
+/// `POST /v1/chat/completions` -- OpenAI-compatible chat completions.
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Extension(validated_client): Extension<ValidatedClient>,
@@ -74,9 +75,6 @@ pub async fn chat_completions(
         Err(e) => return e.into_response(),
     };
 
-    // Override model with the resolved model from ModelOverrideLayer (if set).
-    // This enables semantic routing and static/mapping model selection modes
-    // to actually change which provider is used.
     let model = resolved_model_ext
         .map(|Extension(r)| r.0)
         .unwrap_or_else(|| request.model.clone());
@@ -97,7 +95,6 @@ pub async fn chat_completions(
         None => return ProxyError::NoKey(provider_name).into_response(),
     };
 
-    // Build RequestContext with resolved identity.
     let ctx = build_request_context(
         &validated_client,
         &headers,
@@ -106,28 +103,27 @@ pub async fn chat_completions(
     )
     .await;
 
-    let key = match key_pool.select(&ctx) {
+    let key_arc = match key_pool.select(&ctx) {
         Some(k) => k,
         None => return ProxyError::NoKey(provider_name).into_response(),
     };
+    // Warn if provider unhealthy (fail-open).
+    if !state.health_checker.is_healthy(&provider_name) {
+        tracing::warn!(provider = %provider_name, "chat_completions: provider unhealthy");
+    }
+    let key_snapshot = key_arc.read().unwrap().clone();
 
     if is_streaming {
-        let stream_result = provider.send_streaming(request, key).await;
+        let stream_result = provider.send_streaming(request, &key_snapshot).await;
         match stream_result {
             Err(e) => {
                 tracing::error!(error = %e, "streaming upstream error");
                 ProxyError::Upstream(e.to_string()).into_response()
             }
-            Ok(byte_stream) => {
-                // Convert BoxStream<Bytes, SwitchboardError> to a reqwest-like
-                // response using a channel-bridged synthetic reqwest::Response.
-                // Since we can't easily create a reqwest::Response from a stream,
-                // we build a streaming axum response directly.
-                build_streaming_response(byte_stream).await
-            }
+            Ok(byte_stream) => build_streaming_response(byte_stream).await,
         }
     } else {
-        match provider.send(request, key).await {
+        match provider.send(request, &key_snapshot).await {
             Err(e) => {
                 tracing::error!(error = %e, "upstream error");
                 ProxyError::Upstream(e.to_string()).into_response()
@@ -142,8 +138,6 @@ pub async fn chat_completions(
                         usage.input_tokens,
                         usage.output_tokens,
                     );
-                    // Record tokens against the rate-limit bucket so TPM limits
-                    // are enforced based on actual usage returned by the provider.
                     if let Some(handle) = &state.rate_limit_handle {
                         handle.record_tokens(user_id, usage.input_tokens + usage.output_tokens);
                     }
@@ -155,10 +149,7 @@ pub async fn chat_completions(
     }
 }
 
-/// `POST /api/v1/messages` — Anthropic native Messages API.
-///
-/// Parses the body as an Anthropic Messages request, routes to the appropriate
-/// upstream provider, and returns the response in Anthropic format.
+/// `POST /api/v1/messages` -- Anthropic native Messages API.
 pub async fn anthropic_messages(
     State(state): State<Arc<AppState>>,
     Extension(validated_client): Extension<ValidatedClient>,
@@ -176,9 +167,6 @@ pub async fn anthropic_messages(
         Err(e) => return e.into_response(),
     };
 
-    // Override model with the resolved model from ModelOverrideLayer (if set).
-    // This enables semantic routing and static/mapping model selection modes
-    // to actually change which provider is used.
     let model = resolved_model_ext
         .map(|Extension(r)| r.0)
         .unwrap_or_else(|| request.model.clone());
@@ -199,7 +187,6 @@ pub async fn anthropic_messages(
         None => return ProxyError::NoKey(provider_name).into_response(),
     };
 
-    // Build RequestContext with resolved identity.
     let ctx = build_request_context(
         &validated_client,
         &headers,
@@ -208,13 +195,18 @@ pub async fn anthropic_messages(
     )
     .await;
 
-    let key = match key_pool.select(&ctx) {
+    let key_arc = match key_pool.select(&ctx) {
         Some(k) => k,
         None => return ProxyError::NoKey(provider_name).into_response(),
     };
+    // Warn if provider unhealthy (fail-open).
+    if !state.health_checker.is_healthy(&provider_name) {
+        tracing::warn!(provider = %provider_name, "anthropic_messages: provider unhealthy");
+    }
+    let key_snapshot = key_arc.read().unwrap().clone();
 
     if is_streaming {
-        let stream_result = provider.send_streaming(request, key).await;
+        let stream_result = provider.send_streaming(request, &key_snapshot).await;
         match stream_result {
             Err(e) => {
                 tracing::error!(error = %e, "streaming upstream error");
@@ -223,7 +215,7 @@ pub async fn anthropic_messages(
             Ok(byte_stream) => build_streaming_response(byte_stream).await,
         }
     } else {
-        match provider.send(request, key).await {
+        match provider.send(request, &key_snapshot).await {
             Err(e) => {
                 tracing::error!(error = %e, "upstream error");
                 ProxyError::Upstream(e.to_string()).into_response()
@@ -238,8 +230,6 @@ pub async fn anthropic_messages(
                         usage.input_tokens,
                         usage.output_tokens,
                     );
-                    // Record tokens against the rate-limit bucket so TPM limits
-                    // are enforced based on actual usage returned by the provider.
                     if let Some(handle) = &state.rate_limit_handle {
                         handle.record_tokens(user_id, usage.input_tokens + usage.output_tokens);
                     }
@@ -251,7 +241,7 @@ pub async fn anthropic_messages(
     }
 }
 
-/// `GET /v1/models` — List all models available across registered providers.
+/// `GET /v1/models` -- List all models available across registered providers.
 pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let models: Vec<serde_json::Value> = state
         .config
@@ -275,9 +265,7 @@ pub async fn list_models(State(state): State<Arc<AppState>>) -> impl IntoRespons
     }))
 }
 
-/// `GET /health` — Simple health check.
-///
-/// Returns `{"status": "ok"}` with HTTP 200.
+/// `GET /health` -- Simple health check.
 pub async fn health() -> impl IntoResponse {
     (StatusCode::OK, Json(serde_json::json!({"status": "ok"})))
 }
@@ -286,24 +274,42 @@ pub async fn health() -> impl IntoResponse {
 
 /// Build an [`IdentityChain`] from the server's identity config.
 ///
-/// Currently supports `"header"`, `"jwt"`, and `"tool"` resolver strategies.
-/// `ToolSpecificResolver` is always prepended as the first resolver because it
-/// only enriches the identity (sets the tool source) without overriding
-/// `user_id`. When `"tool"` appears explicitly in `config.resolvers` a second
-/// instance is NOT added.
-///
-/// `"api_key"` and `"mtls_cn"` resolvers require runtime state and are
-/// added to the chain in a future phase.
+/// Supports "header", "jwt", "api_key", and "tool" resolver strategies.
+/// `ToolSpecificResolver` is always prepended. The "api_key" resolver uses
+/// [`IdentityConfig::api_key_mappings`]; an empty list means it always
+/// returns None. "mtls_cn" is added in a future phase.
 fn build_identity_chain(config: &IdentityConfig) -> IdentityChain {
     let mut resolvers: Vec<Box<dyn crate::identity::IdentityResolver>> = Vec::new();
 
-    // Always add ToolSpecificResolver first — it enriches without overriding.
+    // Always add ToolSpecificResolver first -- it enriches without overriding.
     resolvers.push(Box::new(ToolSpecificResolver));
 
     for resolver_name in &config.resolvers {
         match resolver_name.as_str() {
             "header" => resolvers.push(Box::new(HeaderResolver)),
             "jwt" => resolvers.push(Box::new(JwtClaimResolver::new(&config.jwt_claim))),
+            "api_key" => {
+                let mapping: HashMap<String, UserIdentity> = config
+                    .api_key_mappings
+                    .iter()
+                    .map(|m| {
+                        (
+                            m.api_key.clone(),
+                            UserIdentity {
+                                id: m.user_id.clone(),
+                                name: None,
+                                team: m.team.clone(),
+                                source: IdentitySource::ApiKeyMapping,
+                            },
+                        )
+                    })
+                    .collect();
+                tracing::info!(
+                    mapping_count = mapping.len(),
+                    "registered api_key identity resolver"
+                );
+                resolvers.push(Box::new(ApiKeyMappingResolver::new(mapping)));
+            }
             // ToolSpecificResolver is already prepended above; skip duplicates.
             "tool" => {}
             _ => {
@@ -314,15 +320,26 @@ fn build_identity_chain(config: &IdentityConfig) -> IdentityChain {
     IdentityChain::new(resolvers)
 }
 
+/// Strip the "Bearer " prefix (case-insensitive) from an Authorization header value.
+fn strip_bearer_prefix(value: &str) -> &str {
+    let v = value.trim();
+    // Try case-sensitive first, then lowercase. After stripping the prefix,
+    // trim the result to handle trailing whitespace (e.g. "Bearer ").
+    if let Some(rest) = v
+        .strip_prefix("Bearer")
+        .or_else(|| v.strip_prefix("bearer"))
+    {
+        rest.trim_start_matches(' ').trim()
+    } else {
+        v
+    }
+}
+
 /// Build a [`RequestContext`] with identity resolved from the auth layer and
 /// identity chain.
 ///
-/// Steps:
-/// 1. Start from a fresh context with a new request ID.
-/// 2. Populate `user_id` from [`ValidatedClient`] (set by [`AuthLayer`]).
-/// 3. Copy Switchboard protocol headers from the HTTP request headers.
-/// 4. Run the [`IdentityChain`] to resolve / override user and team.
-/// 5. Set the model.
+/// Injects the raw API key (without "Bearer " prefix) into
+/// `switchboard_headers["__api_key"]` so [`ApiKeyMappingResolver`] can find it.
 async fn build_request_context(
     validated_client: &ValidatedClient,
     headers: &HeaderMap,
@@ -332,12 +349,10 @@ async fn build_request_context(
     let mut ctx = RequestContext::new();
     ctx.model = model;
 
-    // Seed from ValidatedClient (JWT sub / email claim from AuthLayer).
     if let Some(uid) = &validated_client.user_id {
         ctx.user_id = Some(uid.clone());
     }
 
-    // Copy Switchboard protocol headers into the context.
     for (name, value) in headers.iter() {
         if switchboard_common::protocol::is_switchboard_header(name.as_str()) {
             if let Ok(v) = value.to_str() {
@@ -347,7 +362,19 @@ async fn build_request_context(
         }
     }
 
-    // Run the identity chain to resolve / override user_id and team.
+    // Inject the raw API key so ApiKeyMappingResolver can look it up.
+    if let Some(auth_value) = headers.get(axum::http::header::AUTHORIZATION) {
+        if let Ok(auth_str) = auth_value.to_str() {
+            let raw_key = strip_bearer_prefix(auth_str);
+            if !raw_key.is_empty() {
+                ctx.switchboard_headers.insert(
+                    crate::identity::api_key_mapping::API_KEY_HEADER.to_string(),
+                    raw_key.to_string(),
+                );
+            }
+        }
+    }
+
     let chain = build_identity_chain(identity_config);
     let identity = chain.resolve(&ctx).await;
     if !identity.is_anonymous() {
@@ -365,9 +392,6 @@ async fn build_request_context(
 
 // ── Streaming response builder ────────────────────────────────────────────────
 
-/// Build a streaming axum response from a [`crate::routing::BoxStream`].
-///
-/// Yields all bytes from the stream as-is, with SSE content headers set.
 async fn build_streaming_response(mut stream: crate::routing::BoxStream) -> Response {
     use axum::body::Body;
     use futures_util::StreamExt;
@@ -447,7 +471,10 @@ mod tests {
     }
 
     fn make_pool(key: PooledKey) -> Arc<KeyPool> {
-        Arc::new(KeyPool::new(vec![key], Box::new(WeightedRandomSelector)))
+        Arc::new(KeyPool::new(
+            vec![Arc::new(std::sync::RwLock::new(key))],
+            Box::new(WeightedRandomSelector),
+        ))
     }
 
     fn openai_state(mock_url: &str) -> Arc<AppState> {
@@ -488,6 +515,7 @@ mod tests {
             key_pools: Arc::new(key_pools),
             usage: Arc::new(crate::observability::UsageTracker::new()),
             rate_limit_handle: None,
+            health_checker: Arc::new(crate::routing::ProviderHealthChecker::new()),
         })
     }
 
@@ -528,11 +556,11 @@ mod tests {
             key_pools: Arc::new(key_pools),
             usage: Arc::new(crate::observability::UsageTracker::new()),
             rate_limit_handle: None,
+            health_checker: Arc::new(crate::routing::ProviderHealthChecker::new()),
         })
     }
 
     fn build_router(state: Arc<AppState>) -> Router {
-        // Use a passthrough validated client extension.
         let validated_client = ValidatedClient::from_static_key();
         Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -559,6 +587,7 @@ mod tests {
             key_pools: Arc::new(HashMap::new()),
             usage: Arc::new(crate::observability::UsageTracker::new()),
             rate_limit_handle: None,
+            health_checker: Arc::new(crate::routing::ProviderHealthChecker::new()),
         });
         let app = build_router(state);
 
@@ -600,6 +629,7 @@ mod tests {
             key_pools: Arc::new(HashMap::new()),
             usage: Arc::new(crate::observability::UsageTracker::new()),
             rate_limit_handle: None,
+            health_checker: Arc::new(crate::routing::ProviderHealthChecker::new()),
         });
         let app = build_router(state);
 
@@ -713,6 +743,7 @@ mod tests {
             key_pools: Arc::new(HashMap::new()),
             usage: Arc::new(crate::observability::UsageTracker::new()),
             rate_limit_handle: None,
+            health_checker: Arc::new(crate::routing::ProviderHealthChecker::new()),
         });
         let app = build_router(state);
 
@@ -740,6 +771,7 @@ mod tests {
             key_pools: Arc::new(HashMap::new()),
             usage: Arc::new(crate::observability::UsageTracker::new()),
             rate_limit_handle: None,
+            health_checker: Arc::new(crate::routing::ProviderHealthChecker::new()),
         });
         let app = build_router(state);
 
@@ -751,7 +783,6 @@ mod tests {
             .unwrap();
 
         let resp = app.oneshot(req).await.unwrap();
-        // axum returns 400 for malformed JSON that fails deserialization.
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -793,9 +824,9 @@ mod tests {
             resolvers: vec!["header".into()],
             header_name: "x-switchboard-user".into(),
             jwt_claim: "email".into(),
+            api_key_mappings: vec![],
         };
         let chain = build_identity_chain(&config);
-        // ToolSpecificResolver is always prepended; "header" adds a second.
         let dbg = format!("{chain:?}");
         assert!(dbg.contains("resolver_count: 2"));
     }
@@ -808,9 +839,9 @@ mod tests {
             resolvers: vec!["jwt".into()],
             header_name: "x-switchboard-user".into(),
             jwt_claim: "email".into(),
+            api_key_mappings: vec![],
         };
         let chain = build_identity_chain(&config);
-        // ToolSpecificResolver is always prepended; "jwt" adds a second.
         let dbg = format!("{chain:?}");
         assert!(dbg.contains("resolver_count: 2"));
     }
@@ -823,9 +854,9 @@ mod tests {
             resolvers: vec!["header".into(), "unknown_resolver".into(), "jwt".into()],
             header_name: "x-switchboard-user".into(),
             jwt_claim: "email".into(),
+            api_key_mappings: vec![],
         };
         let chain = build_identity_chain(&config);
-        // ToolSpecificResolver (always) + "header" + "jwt" = 3; "unknown_resolver" is skipped.
         let dbg = format!("{chain:?}");
         assert!(dbg.contains("resolver_count: 3"));
     }
@@ -834,15 +865,13 @@ mod tests {
     fn test_build_identity_chain_tool_resolver_not_duplicated() {
         use crate::config::IdentityConfig;
 
-        // When "tool" appears explicitly in resolvers, it should NOT be added
-        // a second time (ToolSpecificResolver is already prepended).
         let config = IdentityConfig {
             resolvers: vec!["tool".into(), "header".into()],
             header_name: "x-switchboard-user".into(),
             jwt_claim: "email".into(),
+            api_key_mappings: vec![],
         };
         let chain = build_identity_chain(&config);
-        // ToolSpecificResolver (always) + "header" = 2; "tool" not duplicated.
         let dbg = format!("{chain:?}");
         assert!(dbg.contains("resolver_count: 2"));
     }
@@ -855,11 +884,135 @@ mod tests {
             resolvers: vec![],
             header_name: "x-switchboard-user".into(),
             jwt_claim: "email".into(),
+            api_key_mappings: vec![],
         };
         let chain = build_identity_chain(&config);
-        // Even with empty config.resolvers, ToolSpecificResolver is prepended.
         let dbg = format!("{chain:?}");
         assert!(dbg.contains("resolver_count: 1"));
+    }
+
+    #[test]
+    fn test_build_identity_chain_with_api_key_resolver() {
+        use crate::config::{ApiKeyMapping, IdentityConfig};
+
+        let config = IdentityConfig {
+            resolvers: vec!["api_key".into()],
+            header_name: "x-switchboard-user".into(),
+            jwt_claim: "email".into(),
+            api_key_mappings: vec![
+                ApiKeyMapping {
+                    api_key: "sk-alice-key".into(),
+                    user_id: "alice".into(),
+                    team: Some("platform".into()),
+                },
+                ApiKeyMapping {
+                    api_key: "sk-bob-key".into(),
+                    user_id: "bob".into(),
+                    team: None,
+                },
+            ],
+        };
+        let chain = build_identity_chain(&config);
+        // ToolSpecificResolver (always) + ApiKeyMappingResolver = 2.
+        let dbg = format!("{chain:?}");
+        assert!(dbg.contains("resolver_count: 2"));
+    }
+
+    #[test]
+    fn test_build_identity_chain_api_key_resolver_empty_mappings_still_registered() {
+        use crate::config::IdentityConfig;
+
+        let config = IdentityConfig {
+            resolvers: vec!["api_key".into()],
+            header_name: "x-switchboard-user".into(),
+            jwt_claim: "email".into(),
+            api_key_mappings: vec![],
+        };
+        let chain = build_identity_chain(&config);
+        let dbg = format!("{chain:?}");
+        assert!(dbg.contains("resolver_count: 2"));
+    }
+
+    #[tokio::test]
+    async fn test_build_identity_chain_api_key_resolver_resolves_mapped_key() {
+        use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+        use crate::auth::ValidatedClient;
+        use crate::config::{ApiKeyMapping, IdentityConfig};
+
+        let config = IdentityConfig {
+            resolvers: vec!["api_key".into()],
+            header_name: "x-switchboard-user".into(),
+            jwt_claim: "email".into(),
+            api_key_mappings: vec![ApiKeyMapping {
+                api_key: "sk-team-alice-key".into(),
+                user_id: "alice".into(),
+                team: Some("platform".into()),
+            }],
+        };
+
+        let validated_client = ValidatedClient::from_static_key();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer sk-team-alice-key"),
+        );
+
+        let ctx = build_request_context(&validated_client, &headers, &config, None).await;
+
+        assert_eq!(
+            ctx.user_id.as_deref(),
+            Some("alice"),
+            "ApiKeyMappingResolver must set user_id to 'alice' for mapped key"
+        );
+        assert_eq!(
+            ctx.team.as_deref(),
+            Some("platform"),
+            "ApiKeyMappingResolver must propagate team from the mapping"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_identity_chain_api_key_resolver_unknown_key_falls_through() {
+        use axum::http::{HeaderMap, HeaderName, HeaderValue};
+
+        use crate::auth::ValidatedClient;
+        use crate::config::{ApiKeyMapping, IdentityConfig};
+
+        let config = IdentityConfig {
+            resolvers: vec!["api_key".into()],
+            header_name: "x-switchboard-user".into(),
+            jwt_claim: "email".into(),
+            api_key_mappings: vec![ApiKeyMapping {
+                api_key: "sk-team-alice-key".into(),
+                user_id: "alice".into(),
+                team: None,
+            }],
+        };
+
+        let validated_client = ValidatedClient::from_static_key();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_static("Bearer sk-other-key"),
+        );
+
+        let ctx = build_request_context(&validated_client, &headers, &config, None).await;
+
+        assert!(
+            ctx.user_id.is_none(),
+            "Unknown API key must not resolve a user_id; got: {:?}",
+            ctx.user_id
+        );
+    }
+
+    #[test]
+    fn test_strip_bearer_prefix_variants() {
+        assert_eq!(strip_bearer_prefix("Bearer sk-x"), "sk-x");
+        assert_eq!(strip_bearer_prefix("bearer sk-x"), "sk-x");
+        assert_eq!(strip_bearer_prefix("sk-x"), "sk-x");
+        assert_eq!(strip_bearer_prefix("  Bearer  sk-x  "), "sk-x");
+        assert_eq!(strip_bearer_prefix("Bearer "), "");
     }
 
     #[tokio::test]
@@ -874,9 +1027,10 @@ mod tests {
         };
         let headers = HeaderMap::new();
         let identity_config = IdentityConfig {
-            resolvers: vec![], // no chain resolvers — rely on ValidatedClient
+            resolvers: vec![],
             header_name: "x-switchboard-user".into(),
             jwt_claim: "email".into(),
+            api_key_mappings: vec![],
         };
 
         let ctx = build_request_context(
@@ -902,7 +1056,6 @@ mod tests {
             claims: HashMap::new(),
         };
 
-        // Set X-Switchboard-User in the request headers — HeaderResolver should pick it up.
         let mut headers = HeaderMap::new();
         headers.insert(
             HeaderName::from_static("x-switchboard-user"),
@@ -913,11 +1066,11 @@ mod tests {
             resolvers: vec!["header".into()],
             header_name: "x-switchboard-user".into(),
             jwt_claim: "email".into(),
+            api_key_mappings: vec![],
         };
 
         let ctx = build_request_context(&validated_client, &headers, &identity_config, None).await;
 
-        // The header resolver should override the ValidatedClient user_id.
         assert_eq!(ctx.user_id.as_deref(), Some("header-user@example.com"));
     }
 

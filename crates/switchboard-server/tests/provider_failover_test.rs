@@ -47,11 +47,19 @@ fn make_key_with_status(id: &str, status: KeyStatus) -> PooledKey {
 }
 
 fn make_pool_weighted(keys: Vec<PooledKey>) -> KeyPool {
-    KeyPool::new(keys, Box::new(WeightedRandomSelector))
+    let arcs: Vec<std::sync::Arc<std::sync::RwLock<PooledKey>>> = keys
+        .into_iter()
+        .map(|k| std::sync::Arc::new(std::sync::RwLock::new(k)))
+        .collect();
+    KeyPool::new(arcs, Box::new(WeightedRandomSelector))
 }
 
 fn make_pool_round_robin(keys: Vec<PooledKey>) -> KeyPool {
-    KeyPool::new(keys, Box::new(RoundRobinSelector::new()))
+    let arcs: Vec<std::sync::Arc<std::sync::RwLock<PooledKey>>> = keys
+        .into_iter()
+        .map(|k| std::sync::Arc::new(std::sync::RwLock::new(k)))
+        .collect();
+    KeyPool::new(arcs, Box::new(RoundRobinSelector::new()))
 }
 
 fn make_provider_config(models: Vec<String>, api_format: &str) -> ProviderConfig {
@@ -73,8 +81,14 @@ fn make_provider_config(models: Vec<String>, api_format: &str) -> ProviderConfig
 struct FirstEligibleSelector;
 
 impl KeySelector for FirstEligibleSelector {
-    fn select<'a>(&self, pool: &'a [PooledKey], _req: &RequestContext) -> Option<&'a PooledKey> {
-        pool.iter().find(|k| k.is_eligible())
+    fn select(
+        &self,
+        pool: &[std::sync::Arc<std::sync::RwLock<PooledKey>>],
+        _req: &RequestContext,
+    ) -> Option<std::sync::Arc<std::sync::RwLock<PooledKey>>> {
+        pool.iter()
+            .find(|k| k.read().unwrap().is_eligible())
+            .map(std::sync::Arc::clone)
     }
 }
 
@@ -93,7 +107,8 @@ fn test_key_pool_rotates_away_from_rate_limited_key() {
     for i in 0..100 {
         let selected = pool.select(&ctx).expect("pool must return a key");
         assert_eq!(
-            selected.id, "healthy",
+            selected.read().unwrap().id,
+            "healthy",
             "iteration {i}: rate-limited key must never be selected"
         );
     }
@@ -104,12 +119,15 @@ fn test_key_pool_rotates_away_from_rate_limited_key() {
 /// calling `recheck_health`, the key returns to `Healthy`.
 #[test]
 fn test_key_pool_health_transitions() {
-    let mut pool = KeyPool::new(vec![make_key("k1")], Box::new(FirstEligibleSelector));
+    let pool = KeyPool::new(
+        vec![std::sync::Arc::new(std::sync::RwLock::new(make_key("k1")))],
+        Box::new(FirstEligibleSelector),
+    );
 
     // The key starts healthy.
     {
-        let key = pool.get_key_mut("k1").unwrap();
-        assert_eq!(key.health.status, KeyStatus::Healthy);
+        let key_arc = pool.get_key_mut("k1").unwrap();
+        assert_eq!(key_arc.read().unwrap().health.status, KeyStatus::Healthy);
     }
 
     // Record 6 non-rate-limit errors.  The threshold is 5, so the 6th error
@@ -118,9 +136,9 @@ fn test_key_pool_health_transitions() {
         pool.record_error("k1", false);
     }
     {
-        let key = pool.get_key_mut("k1").unwrap();
+        let key_arc = pool.get_key_mut("k1").unwrap();
         assert_eq!(
-            key.health.status,
+            key_arc.read().unwrap().health.status,
             KeyStatus::Degraded,
             "key should be Degraded after exceeding error threshold"
         );
@@ -129,15 +147,15 @@ fn test_key_pool_health_transitions() {
     // Simulate a recovery: clear the error counter (as the sliding window would
     // do after 5 minutes) and call recheck_health.
     {
-        let key = pool.get_key_mut("k1").unwrap();
-        key.health.errors_last_5m = 0;
+        let key_arc = pool.get_key_mut("k1").unwrap();
+        key_arc.write().unwrap().health.errors_last_5m = 0;
     }
     pool.recheck_health();
 
     {
-        let key = pool.get_key_mut("k1").unwrap();
+        let key_arc = pool.get_key_mut("k1").unwrap();
         assert_eq!(
-            key.health.status,
+            key_arc.read().unwrap().health.status,
             KeyStatus::Healthy,
             "key should recover to Healthy after errors are cleared"
         );
@@ -292,7 +310,11 @@ fn test_weighted_random_selector_never_picks_disabled() {
     let healthy_1 = make_key("healthy-1");
     let healthy_2 = make_key("healthy-2");
 
-    let pool_keys = vec![disabled_key, healthy_1, healthy_2];
+    let pool_keys: Vec<std::sync::Arc<std::sync::RwLock<PooledKey>>> = vec![
+        std::sync::Arc::new(std::sync::RwLock::new(disabled_key)),
+        std::sync::Arc::new(std::sync::RwLock::new(healthy_1)),
+        std::sync::Arc::new(std::sync::RwLock::new(healthy_2)),
+    ];
     let ctx = RequestContext::default();
 
     for i in 0..1000 {
@@ -300,7 +322,8 @@ fn test_weighted_random_selector_never_picks_disabled() {
             .select(&pool_keys, &ctx)
             .expect("pool must return a key");
         assert_ne!(
-            selected.id, "disabled",
+            selected.read().unwrap().id,
+            "disabled",
             "iteration {i}: disabled key must never be selected"
         );
     }
@@ -310,20 +333,25 @@ fn test_weighted_random_selector_never_picks_disabled() {
 /// (300 selections → each key selected ~100 times, within 20% tolerance).
 #[test]
 fn test_round_robin_selector_distributes_evenly() {
-    let pool_keys = vec![make_key("k1"), make_key("k2"), make_key("k3")];
+    let pool_keys: Vec<std::sync::Arc<std::sync::RwLock<PooledKey>>> = vec![
+        std::sync::Arc::new(std::sync::RwLock::new(make_key("k1"))),
+        std::sync::Arc::new(std::sync::RwLock::new(make_key("k2"))),
+        std::sync::Arc::new(std::sync::RwLock::new(make_key("k3"))),
+    ];
     let selector = RoundRobinSelector::new();
     let ctx = RequestContext::default();
 
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    counts.insert("k1", 0);
-    counts.insert("k2", 0);
-    counts.insert("k3", 0);
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    counts.insert("k1".into(), 0);
+    counts.insert("k2".into(), 0);
+    counts.insert("k3".into(), 0);
 
     for _ in 0..300 {
         let selected = selector
             .select(&pool_keys, &ctx)
             .expect("selector must return a key");
-        *counts.get_mut(selected.id.as_str()).unwrap() += 1;
+        let id = selected.read().unwrap().id.clone();
+        *counts.get_mut(&id).unwrap() += 1;
     }
 
     // Each key should be selected ~100 times. Allow 20% tolerance (80–120).
@@ -347,7 +375,11 @@ fn test_round_robin_selector_distributes_evenly() {
 /// chosen.
 #[test]
 fn test_sticky_selector_same_user_gets_same_key() {
-    let pool_keys = vec![make_key("k1"), make_key("k2"), make_key("k3")];
+    let pool_keys: Vec<std::sync::Arc<std::sync::RwLock<PooledKey>>> = vec![
+        std::sync::Arc::new(std::sync::RwLock::new(make_key("k1"))),
+        std::sync::Arc::new(std::sync::RwLock::new(make_key("k2"))),
+        std::sync::Arc::new(std::sync::RwLock::new(make_key("k3"))),
+    ];
 
     // Use a round-robin inner selector so the first call picks k1.
     let inner = Box::new(RoundRobinSelector::new());
@@ -362,6 +394,8 @@ fn test_sticky_selector_same_user_gets_same_key() {
     let first_id = selector
         .select(&pool_keys, &ctx)
         .expect("must select a key")
+        .read()
+        .unwrap()
         .id
         .clone();
 
@@ -370,6 +404,8 @@ fn test_sticky_selector_same_user_gets_same_key() {
         let id = selector
             .select(&pool_keys, &ctx)
             .expect("must select a key")
+            .read()
+            .unwrap()
             .id
             .clone();
         assert_eq!(
@@ -383,7 +419,11 @@ fn test_sticky_selector_same_user_gets_same_key() {
 /// assigns k1 → alice, k2 → bob, k3 → carol).
 #[test]
 fn test_sticky_selector_different_users_get_different_keys() {
-    let pool_keys = vec![make_key("k1"), make_key("k2"), make_key("k3")];
+    let pool_keys: Vec<std::sync::Arc<std::sync::RwLock<PooledKey>>> = vec![
+        std::sync::Arc::new(std::sync::RwLock::new(make_key("k1"))),
+        std::sync::Arc::new(std::sync::RwLock::new(make_key("k2"))),
+        std::sync::Arc::new(std::sync::RwLock::new(make_key("k3"))),
+    ];
     let inner = Box::new(RoundRobinSelector::new());
     let selector = StickySelector::new(inner);
 
@@ -400,9 +440,27 @@ fn test_sticky_selector_different_users_get_different_keys() {
         ..Default::default()
     };
 
-    let alice_key = selector.select(&pool_keys, &alice_ctx).unwrap().id.clone();
-    let bob_key = selector.select(&pool_keys, &bob_ctx).unwrap().id.clone();
-    let carol_key = selector.select(&pool_keys, &carol_ctx).unwrap().id.clone();
+    let alice_key = selector
+        .select(&pool_keys, &alice_ctx)
+        .unwrap()
+        .read()
+        .unwrap()
+        .id
+        .clone();
+    let bob_key = selector
+        .select(&pool_keys, &bob_ctx)
+        .unwrap()
+        .read()
+        .unwrap()
+        .id
+        .clone();
+    let carol_key = selector
+        .select(&pool_keys, &carol_ctx)
+        .unwrap()
+        .read()
+        .unwrap()
+        .id
+        .clone();
 
     assert_eq!(alice_key, "k1");
     assert_eq!(bob_key, "k2");
@@ -448,20 +506,26 @@ fn test_key_status_eligibility_semantics() {
 /// still positive, the key stays `RateLimited`.
 #[test]
 fn test_key_pool_rate_limit_persists_until_cleared() {
-    let mut pool = KeyPool::new(vec![make_key("k1")], Box::new(FirstEligibleSelector));
+    let pool = KeyPool::new(
+        vec![std::sync::Arc::new(std::sync::RwLock::new(make_key("k1")))],
+        Box::new(FirstEligibleSelector),
+    );
 
     pool.record_rate_limit("k1");
     {
-        let key = pool.get_key_mut("k1").unwrap();
-        assert_eq!(key.health.status, KeyStatus::RateLimited);
+        let key_arc = pool.get_key_mut("k1").unwrap();
+        assert_eq!(
+            key_arc.read().unwrap().health.status,
+            KeyStatus::RateLimited
+        );
     }
 
     // Recheck without clearing the counter: still rate-limited.
     pool.recheck_health();
     {
-        let key = pool.get_key_mut("k1").unwrap();
+        let key_arc = pool.get_key_mut("k1").unwrap();
         assert_eq!(
-            key.health.status,
+            key_arc.read().unwrap().health.status,
             KeyStatus::RateLimited,
             "rate-limited status persists while the rate_limit_hits counter is > 0"
         );
@@ -469,14 +533,14 @@ fn test_key_pool_rate_limit_persists_until_cleared() {
 
     // Clear the counter: recheck recovers.
     {
-        let key = pool.get_key_mut("k1").unwrap();
-        key.health.rate_limit_hits_last_5m = 0;
+        let key_arc = pool.get_key_mut("k1").unwrap();
+        key_arc.write().unwrap().health.rate_limit_hits_last_5m = 0;
     }
     pool.recheck_health();
     {
-        let key = pool.get_key_mut("k1").unwrap();
+        let key_arc = pool.get_key_mut("k1").unwrap();
         assert_eq!(
-            key.health.status,
+            key_arc.read().unwrap().health.status,
             KeyStatus::Healthy,
             "key should recover to Healthy after rate limit counter is cleared"
         );
@@ -512,7 +576,7 @@ fn test_round_robin_does_not_starve_any_key() {
 
     let mut counts: HashMap<String, usize> = HashMap::new();
     for _ in 0..300 {
-        let id = pool.select(&ctx).unwrap().id.clone();
+        let id = pool.select(&ctx).unwrap().read().unwrap().id.clone();
         *counts.entry(id).or_insert(0) += 1;
     }
 

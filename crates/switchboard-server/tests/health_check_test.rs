@@ -5,7 +5,7 @@
 //! the machinery without going through the full proxy stack.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use http::{HeaderName, HeaderValue};
@@ -37,7 +37,10 @@ fn make_static_key(header_name: &'static str, header_value: &'static str) -> Poo
 }
 
 fn make_pool(key: PooledKey) -> Arc<KeyPool> {
-    Arc::new(KeyPool::new(vec![key], Box::new(WeightedRandomSelector)))
+    Arc::new(KeyPool::new(
+        vec![Arc::new(RwLock::new(key))],
+        Box::new(WeightedRandomSelector),
+    ))
 }
 
 /// Build a ProviderRegistry and key_pools map with a single OpenAI provider

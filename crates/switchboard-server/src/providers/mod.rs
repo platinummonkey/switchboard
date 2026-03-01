@@ -30,7 +30,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::config::provider::ProvidersConfig;
-use crate::routing::UpstreamProvider;
+use crate::routing::{ProviderHealthChecker, UpstreamProvider};
 
 // ── ProviderRegistry ──────────────────────────────────────────────────────────
 
@@ -38,8 +38,17 @@ use crate::routing::UpstreamProvider;
 ///
 /// Provider names are short identifiers like `"anthropic"` or `"openai"` that
 /// match the keys in the [`ProvidersConfig`] map.
+///
+/// An optional [`ProviderHealthChecker`] can be attached via
+/// [`ProviderRegistry::set_health_checker`].  When present, unhealthy providers
+/// are skipped in [`ProviderRegistry::resolve_provider`].  Providers with no
+/// recorded health data are treated as healthy (fail-open semantics on startup).
 pub struct ProviderRegistry {
     providers: HashMap<String, Arc<dyn UpstreamProvider>>,
+    /// Optional health checker; populated after construction via
+    /// [`ProviderRegistry::set_health_checker`] once the background task is
+    /// running.
+    health_checker: Option<Arc<ProviderHealthChecker>>,
 }
 
 impl std::fmt::Debug for ProviderRegistry {
@@ -58,11 +67,21 @@ impl Default for ProviderRegistry {
 }
 
 impl ProviderRegistry {
-    /// Create an empty registry.
+    /// Create an empty registry with no health checker attached.
     pub fn new() -> Self {
         Self {
             providers: HashMap::new(),
+            health_checker: None,
         }
+    }
+
+    /// Attach a [`ProviderHealthChecker`] so that unhealthy providers are
+    /// filtered out during [`ProviderRegistry::resolve_provider`].
+    ///
+    /// This should be called once, after the background health-check task is
+    /// spawned, before the registry is wrapped in [`Arc`].
+    pub fn set_health_checker(&mut self, checker: Arc<ProviderHealthChecker>) {
+        self.health_checker = Some(checker);
     }
 
     /// Register a provider under `name`.
@@ -91,6 +110,10 @@ impl ProviderRegistry {
     /// 3. If found, look up the runtime provider by the config key name.
     /// 4. Returns the first match as `(provider, resolved_model)`.
     ///
+    /// Unhealthy providers (as tracked by the attached [`ProviderHealthChecker`])
+    /// are skipped.  If no health checker is configured, all providers are
+    /// considered healthy (fail-open).
+    ///
     /// The `resolved_model` is the same as `model` — providers are responsible
     /// for their own model-ID translation if needed.
     pub fn resolve_provider(
@@ -102,6 +125,14 @@ impl ProviderRegistry {
         for (name, cfg) in providers_config {
             if cfg.models.iter().any(|m| m == model) {
                 if let Some(provider) = self.providers.get(name) {
+                    if !self.is_provider_healthy(name) {
+                        tracing::debug!(
+                            model = model,
+                            provider = name,
+                            "skipping unhealthy provider (config models list)"
+                        );
+                        continue;
+                    }
                     tracing::debug!(
                         model = model,
                         provider = name,
@@ -115,6 +146,14 @@ impl ProviderRegistry {
         // Second: fall back to asking each registered provider directly.
         for (name, provider) in &self.providers {
             if provider.supports_model(model) {
+                if !self.is_provider_healthy(name) {
+                    tracing::debug!(
+                        model = model,
+                        provider = name,
+                        "skipping unhealthy provider (supports_model)"
+                    );
+                    continue;
+                }
                 tracing::debug!(
                     model = model,
                     provider = name,
@@ -125,6 +164,16 @@ impl ProviderRegistry {
         }
 
         None
+    }
+
+    /// Returns `true` if the provider is healthy according to the attached
+    /// health checker.  If no health checker is configured, or if the provider
+    /// has no recorded health data yet, the result is `true` (fail-open).
+    fn is_provider_healthy(&self, name: &str) -> bool {
+        match &self.health_checker {
+            Some(checker) => checker.is_healthy(name),
+            None => true,
+        }
     }
 
     /// Number of registered providers.
@@ -276,5 +325,88 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"openai"));
         assert!(names.contains(&"anthropic"));
+    }
+
+    #[test]
+    fn test_resolve_provider_skips_unhealthy_via_config() {
+        let mut r = ProviderRegistry::new();
+        r.register("openai", make_openai_provider(vec!["gpt-4o".into()]));
+
+        // Mark openai as unhealthy.
+        let checker = Arc::new(ProviderHealthChecker::new());
+        checker.record("openai", false);
+        r.set_health_checker(Arc::clone(&checker));
+
+        let mut config = ProvidersConfig::new();
+        config.insert(
+            "openai".into(),
+            make_config(vec!["gpt-4o".into()], "openai"),
+        );
+
+        // Should return None because the only matching provider is unhealthy.
+        assert!(
+            r.resolve_provider("gpt-4o", &config).is_none(),
+            "unhealthy provider must not be returned"
+        );
+    }
+
+    #[test]
+    fn test_resolve_provider_skips_unhealthy_via_supports_model() {
+        let mut r = ProviderRegistry::new();
+        r.register("openai", make_openai_provider(vec!["gpt-4o".into()]));
+
+        // Mark openai as unhealthy.
+        let checker = Arc::new(ProviderHealthChecker::new());
+        checker.record("openai", false);
+        r.set_health_checker(Arc::clone(&checker));
+
+        // Empty config forces the fallback supports_model() path.
+        let config = ProvidersConfig::new();
+
+        assert!(
+            r.resolve_provider("gpt-4o", &config).is_none(),
+            "unhealthy provider must not be returned via supports_model path"
+        );
+    }
+
+    #[test]
+    fn test_resolve_provider_returns_healthy_provider() {
+        let mut r = ProviderRegistry::new();
+        r.register("openai", make_openai_provider(vec!["gpt-4o".into()]));
+
+        // Mark openai as healthy explicitly.
+        let checker = Arc::new(ProviderHealthChecker::new());
+        checker.record("openai", true);
+        r.set_health_checker(Arc::clone(&checker));
+
+        let mut config = ProvidersConfig::new();
+        config.insert(
+            "openai".into(),
+            make_config(vec!["gpt-4o".into()], "openai"),
+        );
+
+        let result = r.resolve_provider("gpt-4o", &config);
+        assert!(result.is_some(), "healthy provider must be returned");
+        let (provider, _) = result.unwrap();
+        assert_eq!(provider.name(), "openai");
+    }
+
+    #[test]
+    fn test_resolve_provider_no_checker_is_fail_open() {
+        // No health checker attached — should behave like old code (always healthy).
+        let mut r = ProviderRegistry::new();
+        r.register("openai", make_openai_provider(vec!["gpt-4o".into()]));
+
+        let mut config = ProvidersConfig::new();
+        config.insert(
+            "openai".into(),
+            make_config(vec!["gpt-4o".into()], "openai"),
+        );
+
+        let result = r.resolve_provider("gpt-4o", &config);
+        assert!(
+            result.is_some(),
+            "without health checker all providers are healthy"
+        );
     }
 }
