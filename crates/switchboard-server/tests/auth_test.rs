@@ -88,6 +88,7 @@ fn openai_app_state_with_key(mock_url: &str, key: PooledKey) -> Arc<AppState> {
         providers: Arc::new(registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     })
 }
 
@@ -266,6 +267,7 @@ async fn test_key_pool_exhausted_returns_503() {
         providers: Arc::new(registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     });
 
     let app = build_test_router(state);
@@ -416,6 +418,7 @@ async fn test_health_endpoint_unauthenticated() {
         providers: Arc::new(ProviderRegistry::new()),
         key_pools: Arc::new(HashMap::new()),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     });
 
     // Deliberately use the router WITHOUT the auth extension injector to

@@ -21,7 +21,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use switchboard_local::auth::LocalAuthManager;
 use switchboard_local::config::{
-    AuthConfig, IdentityConfig, LocalConfig, LocalListenConfig, ModelConfig,
+    AuthConfig, IdentityConfig, LocalConfig, LocalListenConfig, ModelConfig, OAuthConfig,
     ServerConfig as LocalServerConfig,
 };
 use switchboard_local::model_prefs::ModelPrefs;
@@ -705,4 +705,243 @@ async fn test_local_timeout_on_slow_server() {
             );
         }
     }
+}
+
+// ── OAuth2 helpers ─────────────────────────────────────────────────────────────
+
+/// Build a [`LocalConfig`] that uses `"oauth"` auth, pointing the token
+/// endpoint at `token_url` and the switchboard-server at `server_url`.
+fn build_local_config_oauth(server_url: &str, token_url: &str) -> Arc<LocalConfig> {
+    Arc::new(LocalConfig {
+        server: LocalServerConfig {
+            url: server_url.to_owned(),
+        },
+        auth: AuthConfig {
+            method: "oauth".into(),
+            api_key: None,
+            oauth: OAuthConfig {
+                client_id: "test-client".into(),
+                token_url: token_url.to_owned(),
+                client_secret: None,
+            },
+            ..AuthConfig::default()
+        },
+        identity: IdentityConfig::default(),
+        local: LocalListenConfig::default(),
+        model: ModelConfig {
+            default: "gpt-4o".into(),
+            overrides: HashMap::new(),
+        },
+    })
+}
+
+// ── OAuth2 tests ──────────────────────────────────────────────────────────────
+
+/// OAuth2 token fetch and full-stack authentication.
+///
+/// Verifies that when `switchboard-local` is configured with `auth.method =
+/// "oauth"`, it:
+///
+/// 1. Fetches a token from the OAuth2 token endpoint before forwarding a
+///    request.
+/// 2. Sends `Authorization: Bearer <token>` to `switchboard-server`.
+/// 3. The server accepts the token (it matches the static-key validator) and
+///    the request flows through to the upstream mock, returning 200.
+///
+/// Stack:
+/// ```text
+/// reqwest test client
+///     → switchboard-local  (OAuth auth)
+///         → switchboard-server  (static_keys validator accepting "test-api-key")
+///             → wiremock  (upstream LLM provider)
+/// ```
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_local_oauth2_fetches_token_and_authenticates() {
+    // 1. Start the OAuth2 token-endpoint mock.
+    //    The access_token must match the static key the server expects.
+    let oauth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "access_token": "test-api-key",
+                    "token_type": "Bearer",
+                    "expires_in": 3600
+                }))
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&oauth_server)
+        .await;
+
+    // 2. Start wiremock (simulates upstream LLM provider).
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(openai_chat_response("oauth ok"))
+                .insert_header("content-type", "application/json"),
+        )
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    // 3. Start switchboard-server pointing at wiremock.
+    let server_config = build_server_config(&upstream.uri());
+    let (server_addr, _server_shutdown) = start_server(server_config).await;
+    let server_url = format!("http://{server_addr}");
+
+    // 4. Build the local config with OAuth auth, then start local proxy.
+    let token_url = format!("{}/token", oauth_server.uri());
+    let local_config = build_local_config_oauth(&server_url, &token_url);
+    let local_state = make_local_state(local_config).await;
+    let (local_url, _local_handle) = start_local(local_state).await;
+
+    // 5. Send a chat completion request through the local proxy.
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{local_url}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hello via oauth"}]
+        }))
+        .send()
+        .await
+        .expect("request to local proxy failed");
+
+    assert_eq!(
+        resp.status().as_u16(),
+        200,
+        "expected 200 OK when OAuth token is accepted by the server"
+    );
+
+    let body: serde_json::Value = resp.json().await.expect("response must be valid JSON");
+    assert!(
+        body["choices"].is_array(),
+        "response must contain a 'choices' array"
+    );
+
+    // 6. Verify that the OAuth token endpoint was called at least once
+    //    (during LocalAuthManager::new initialisation).
+    let oauth_requests = oauth_server
+        .received_requests()
+        .await
+        .expect("failed to retrieve OAuth server requests");
+    assert!(
+        !oauth_requests.is_empty(),
+        "OAuth token endpoint must have been called at least once"
+    );
+
+    // 7. Verify the upstream mock received exactly one request (no duplicates).
+    upstream.verify().await;
+}
+
+/// OAuth2 token refresh after the initial token expires.
+///
+/// Configures the OAuth2 mock to return a very short-lived token
+/// (`expires_in: 1`).  The background refresh loop inside
+/// [`LocalAuthManager`] subtracts the 30-second margin from the TTL, which
+/// saturates to zero — meaning the loop immediately retries after its first
+/// sleep of 0 seconds.  We give it 200 ms to fire at least one refresh
+/// cycle, then verify:
+///
+/// * Both requests returned 200.
+/// * The token endpoint was called more than once (initial fetch + at least
+///   one background refresh).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_local_oauth2_token_refresh_after_expiry() {
+    // 1. OAuth mock that always returns a short-lived token.
+    let oauth_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({
+                    "access_token": "test-api-key",
+                    "token_type": "Bearer",
+                    // Very short TTL: the refresh loop sleep saturates to 0 s
+                    // (30 s margin > 1 s TTL), triggering an immediate refresh.
+                    "expires_in": 1
+                }))
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&oauth_server)
+        .await;
+
+    // 2. Upstream LLM provider mock.
+    let upstream = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(openai_chat_response("refresh ok"))
+                .insert_header("content-type", "application/json"),
+        )
+        .mount(&upstream)
+        .await;
+
+    // 3. Start switchboard-server.
+    let server_config = build_server_config(&upstream.uri());
+    let (server_addr, _server_shutdown) = start_server(server_config).await;
+    let server_url = format!("http://{server_addr}");
+
+    // 4. Build local config with OAuth auth and start local proxy.
+    let token_url = format!("{}/token", oauth_server.uri());
+    let local_config = build_local_config_oauth(&server_url, &token_url);
+    let local_state = make_local_state(local_config).await;
+    let (local_url, _local_handle) = start_local(local_state).await;
+
+    let client = reqwest::Client::new();
+
+    // 5. First request — must succeed (uses the initial token).
+    let resp1 = client
+        .post(format!("{local_url}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "first request"}]
+        }))
+        .send()
+        .await
+        .expect("first request to local proxy failed");
+    assert_eq!(
+        resp1.status().as_u16(),
+        200,
+        "first request must return 200"
+    );
+
+    // 6. Wait for the background OAuth refresh loop to fire.
+    //    With expires_in=1 and a 30 s margin, sleep_secs saturates to 0,
+    //    so the loop fires essentially immediately after the first sleep.
+    //    200 ms is generous enough for the async task to run.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // 7. Second request — must succeed with the refreshed token.
+    let resp2 = client
+        .post(format!("{local_url}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "second request after refresh"}]
+        }))
+        .send()
+        .await
+        .expect("second request to local proxy failed");
+    assert_eq!(
+        resp2.status().as_u16(),
+        200,
+        "second request must return 200 after token refresh"
+    );
+
+    // 8. The token endpoint must have been called more than once:
+    //    once during LocalAuthManager::new and at least once by the refresh loop.
+    let oauth_requests = oauth_server
+        .received_requests()
+        .await
+        .expect("failed to retrieve OAuth server requests");
+    assert!(
+        oauth_requests.len() >= 2,
+        "OAuth token endpoint should have been called at least twice \
+         (initial fetch + background refresh), got {}",
+        oauth_requests.len()
+    );
 }

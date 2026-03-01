@@ -88,6 +88,7 @@ fn openai_app_state(mock_url: &str) -> Arc<AppState> {
         providers: Arc::new(registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     })
 }
 
@@ -135,6 +136,7 @@ fn anthropic_app_state(mock_url: &str) -> Arc<AppState> {
         providers: Arc::new(registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     })
 }
 

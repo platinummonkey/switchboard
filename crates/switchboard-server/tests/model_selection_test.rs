@@ -231,6 +231,7 @@ async fn test_mapping_mode_rewrites_model() {
         providers: Arc::new(registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     });
 
     let app = build_test_router(state);
@@ -325,6 +326,7 @@ async fn test_dynamic_mode_respects_header() {
         providers: Arc::new(registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     });
 
     let app = build_test_router(state);
@@ -397,6 +399,7 @@ async fn test_unknown_model_returns_400() {
         providers: Arc::new(registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     });
 
     let app = build_test_router(state);
@@ -467,6 +470,7 @@ async fn test_list_models_returns_configured_models() {
         providers: Arc::new(ProviderRegistry::new()),
         key_pools: Arc::new(HashMap::new()),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     });
 
     let app = build_test_router(state);

@@ -92,6 +92,7 @@ fn openai_app_state(mock_url: &str) -> Arc<AppState> {
         providers: Arc::new(registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     })
 }
 
@@ -140,6 +141,7 @@ fn anthropic_app_state(mock_url: &str) -> Arc<AppState> {
         providers: Arc::new(registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     })
 }
 
@@ -317,6 +319,7 @@ async fn test_health_endpoint() {
         providers: Arc::new(ProviderRegistry::new()),
         key_pools: Arc::new(HashMap::new()),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     });
     let app = build_test_router(state);
 
@@ -484,6 +487,7 @@ async fn test_no_key_pool_returns_503() {
         providers: Arc::new(registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     });
 
     let app = build_test_router(state);
@@ -547,6 +551,7 @@ fn vertex_app_state(mock_url: &str) -> Arc<AppState> {
         providers: Arc::new(registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     })
 }
 
@@ -589,6 +594,7 @@ fn ollama_app_state(mock_url: &str) -> Arc<AppState> {
         providers: Arc::new(registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     })
 }
 
@@ -660,6 +666,7 @@ async fn test_bedrock_non_streaming() {
         providers: Arc::new(registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::new(switchboard_server::observability::UsageTracker::new()),
+        rate_limit_handle: None,
     });
 
     // Verify that the BedrockProvider is correctly registered and resolves the

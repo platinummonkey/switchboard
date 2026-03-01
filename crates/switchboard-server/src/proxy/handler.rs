@@ -24,6 +24,7 @@ use crate::config::IdentityConfig;
 use crate::config::ServerConfig;
 use crate::identity::{HeaderResolver, IdentityChain, JwtClaimResolver, ToolSpecificResolver};
 use crate::key_pool::KeyPool;
+use crate::middleware::model_override::ResolvedModel;
 use crate::observability::UsageTracker;
 use crate::providers::ProviderRegistry;
 use crate::proxy::error::ProxyError;
@@ -44,6 +45,9 @@ pub struct AppState {
     pub key_pools: Arc<HashMap<String, Arc<KeyPool>>>,
     /// In-memory usage tracker (shared with admin API).
     pub usage: Arc<UsageTracker>,
+    /// Rate-limit handle for recording token usage post-response.
+    /// `None` when rate limiting is disabled.
+    pub rate_limit_handle: Option<crate::middleware::RateLimitHandle>,
 }
 
 // ── Route handlers ────────────────────────────────────────────────────────────
@@ -56,6 +60,7 @@ pub struct AppState {
 pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Extension(validated_client): Extension<ValidatedClient>,
+    resolved_model_ext: Option<Extension<ResolvedModel>>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
@@ -69,7 +74,13 @@ pub async fn chat_completions(
         Err(e) => return e.into_response(),
     };
 
-    let model = request.model.clone();
+    // Override model with the resolved model from ModelOverrideLayer (if set).
+    // This enables semantic routing and static/mapping model selection modes
+    // to actually change which provider is used.
+    let model = resolved_model_ext
+        .map(|Extension(r)| r.0)
+        .unwrap_or_else(|| request.model.clone());
+
     tracing::info!(model = %model, stream = is_streaming, "chat_completions request");
 
     let (provider, resolved_model) = match state
@@ -123,13 +134,19 @@ pub async fn chat_completions(
             }
             Ok(resp) => {
                 if let Some(usage) = &resp.usage {
+                    let user_id = ctx.user_id.as_deref().unwrap_or("anonymous");
                     state.usage.record(
-                        ctx.user_id.as_deref().unwrap_or("anonymous"),
+                        user_id,
                         &resp.model,
                         &provider_name,
                         usage.input_tokens,
                         usage.output_tokens,
                     );
+                    // Record tokens against the rate-limit bucket so TPM limits
+                    // are enforced based on actual usage returned by the provider.
+                    if let Some(handle) = &state.rate_limit_handle {
+                        handle.record_tokens(user_id, usage.input_tokens + usage.output_tokens);
+                    }
                 }
                 let json = proxied_to_openai(&resp);
                 Json(json).into_response()
@@ -145,6 +162,7 @@ pub async fn chat_completions(
 pub async fn anthropic_messages(
     State(state): State<Arc<AppState>>,
     Extension(validated_client): Extension<ValidatedClient>,
+    resolved_model_ext: Option<Extension<ResolvedModel>>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
@@ -158,7 +176,13 @@ pub async fn anthropic_messages(
         Err(e) => return e.into_response(),
     };
 
-    let model = request.model.clone();
+    // Override model with the resolved model from ModelOverrideLayer (if set).
+    // This enables semantic routing and static/mapping model selection modes
+    // to actually change which provider is used.
+    let model = resolved_model_ext
+        .map(|Extension(r)| r.0)
+        .unwrap_or_else(|| request.model.clone());
+
     tracing::info!(model = %model, stream = is_streaming, "anthropic_messages request");
 
     let (provider, resolved_model) = match state
@@ -206,13 +230,19 @@ pub async fn anthropic_messages(
             }
             Ok(resp) => {
                 if let Some(usage) = &resp.usage {
+                    let user_id = ctx.user_id.as_deref().unwrap_or("anonymous");
                     state.usage.record(
-                        ctx.user_id.as_deref().unwrap_or("anonymous"),
+                        user_id,
                         &resp.model,
                         &provider_name,
                         usage.input_tokens,
                         usage.output_tokens,
                     );
+                    // Record tokens against the rate-limit bucket so TPM limits
+                    // are enforced based on actual usage returned by the provider.
+                    if let Some(handle) = &state.rate_limit_handle {
+                        handle.record_tokens(user_id, usage.input_tokens + usage.output_tokens);
+                    }
                 }
                 let json = proxied_to_anthropic(&resp);
                 Json(json).into_response()
@@ -457,6 +487,7 @@ mod tests {
             providers: Arc::new(registry),
             key_pools: Arc::new(key_pools),
             usage: Arc::new(crate::observability::UsageTracker::new()),
+            rate_limit_handle: None,
         })
     }
 
@@ -496,6 +527,7 @@ mod tests {
             providers: Arc::new(registry),
             key_pools: Arc::new(key_pools),
             usage: Arc::new(crate::observability::UsageTracker::new()),
+            rate_limit_handle: None,
         })
     }
 
@@ -526,6 +558,7 @@ mod tests {
             providers: Arc::new(ProviderRegistry::new()),
             key_pools: Arc::new(HashMap::new()),
             usage: Arc::new(crate::observability::UsageTracker::new()),
+            rate_limit_handle: None,
         });
         let app = build_router(state);
 
@@ -566,6 +599,7 @@ mod tests {
             providers: Arc::new(ProviderRegistry::new()),
             key_pools: Arc::new(HashMap::new()),
             usage: Arc::new(crate::observability::UsageTracker::new()),
+            rate_limit_handle: None,
         });
         let app = build_router(state);
 
@@ -678,6 +712,7 @@ mod tests {
             providers: Arc::new(ProviderRegistry::new()),
             key_pools: Arc::new(HashMap::new()),
             usage: Arc::new(crate::observability::UsageTracker::new()),
+            rate_limit_handle: None,
         });
         let app = build_router(state);
 
@@ -704,6 +739,7 @@ mod tests {
             providers: Arc::new(ProviderRegistry::new()),
             key_pools: Arc::new(HashMap::new()),
             usage: Arc::new(crate::observability::UsageTracker::new()),
+            rate_limit_handle: None,
         });
         let app = build_router(state);
 

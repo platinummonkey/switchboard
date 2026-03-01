@@ -34,7 +34,7 @@ use crate::config::HotConfig;
 use crate::guardrails::pipeline::GuardrailPipeline;
 use crate::key_pool::{
     AwsStsProvider, KeyPool, KeyProvider, KeySelector, LeastLoadedSelector, PooledKey,
-    RoundRobinSelector, WeightedRandomSelector,
+    RoundRobinSelector, StickySelector, WeightedRandomSelector,
 };
 use crate::middleware::{
     GuardrailLayer, MiddlewareConfig, RateLimitLayer, RateLimitSettings, build_middleware_stack,
@@ -45,6 +45,7 @@ use crate::providers::{
     VertexProvider,
 };
 use crate::proxy::handler::{AppState, anthropic_messages, chat_completions, health, list_models};
+use crate::routing::ProviderHealthChecker;
 use crate::routing::selector::ModelSelector;
 
 /// Build an [`AuthRegistry`] from the server configuration.
@@ -280,6 +281,7 @@ pub async fn build_providers(
         let selector: Box<dyn KeySelector> = match provider_cfg.key_pool.selector.as_str() {
             "round_robin" => Box::new(RoundRobinSelector::new()),
             "least_loaded" => Box::new(LeastLoadedSelector),
+            "sticky" => Box::new(StickySelector::new(Box::new(RoundRobinSelector::new()))),
             _ => Box::new(WeightedRandomSelector),
         };
 
@@ -361,6 +363,7 @@ pub async fn run_server(
         providers: Arc::new(provider_registry),
         key_pools: Arc::new(key_pools),
         usage: Arc::clone(&usage),
+        rate_limit_handle: Some(rate_limit_handle.clone()),
     });
 
     // Spawn the admin server if enabled.
@@ -409,6 +412,43 @@ pub async fn run_server(
             }
         });
         tracing::info!(addr = %app_state.config.admin.listen, "admin server spawned");
+    }
+
+    // Spawn background provider health checks.
+    //
+    // The health checker probes each registered provider periodically and records
+    // healthy/unhealthy status for observability (tracing logs).  Health results
+    // do not yet influence routing decisions — that is a future improvement.
+    //
+    // TODO (Fix 4 / key refresh): Wiring `spawn_refresh_task` for STS/Vault keys
+    // requires `KeyPool` to store `Arc<RwLock<PooledKey>>` instead of owned
+    // `PooledKey` values.  The current `KeyPool::new(Vec<PooledKey>, …)` signature
+    // takes ownership; `spawn_refresh_task` needs a shared `Arc<RwLock<PooledKey>>`
+    // to write refreshed credentials back.  Steps required:
+    //   1. Change `KeyPool.keys` from `Vec<PooledKey>` to `Vec<Arc<RwLock<PooledKey>>>`.
+    //   2. Update `KeySelector::select` and all downstream selectors to dereference
+    //      the `Arc<RwLock>` when reading credentials.
+    //   3. In `build_providers`, wrap each STS/Vault key in `Arc<RwLock<…>>` and
+    //      call `spawn_refresh_task` before inserting into the pool.
+    {
+        let health_interval = app_state
+            .config
+            .providers
+            .values()
+            .filter_map(|p| crate::config::duration::parse(&p.health_check_interval).ok())
+            .min()
+            .unwrap_or(std::time::Duration::from_secs(30));
+
+        let health_checker = Arc::new(ProviderHealthChecker::new());
+        Arc::clone(&health_checker).spawn_health_checks(
+            Arc::clone(&app_state.providers),
+            Arc::clone(&app_state.key_pools),
+            health_interval,
+        );
+        tracing::info!(
+            interval_secs = health_interval.as_secs(),
+            "provider health checker spawned"
+        );
     }
 
     // Build guardrail pipeline from config (if enabled).

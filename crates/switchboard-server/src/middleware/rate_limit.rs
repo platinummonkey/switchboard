@@ -17,7 +17,8 @@
 //!
 //! Token estimation: when the exact token count is not known at request time
 //! (before the LLM responds), a conservative estimate of 0 input tokens is
-//! assumed; the caller may update the bucket post-response in a later phase.
+//! assumed; the caller updates the bucket post-response via
+//! [`RateLimitHandle::record_tokens`] once the provider returns actual usage.
 //!
 //! Per-user overrides are read from the config supplied at construction time
 //! and stored in `overrides`.
@@ -39,11 +40,16 @@ use crate::auth::validator::ValidatedClient;
 
 // ── RateLimitHandle ───────────────────────────────────────────────────────────
 
-/// A handle to the live rate-limit override table.
-/// Cloning this handle gives a reference to the same underlying map.
+/// A handle to the live rate-limit state.
+///
+/// Cloning gives a reference to the same underlying state so changes made
+/// through the handle are immediately visible to in-flight requests.
 #[derive(Debug, Clone)]
 pub struct RateLimitHandle {
     overrides: Arc<DashMap<String, RateLimitSettings>>,
+    /// Shared reference to the full rate-limit state so `record_tokens` can
+    /// update the per-user token bucket after a response is received.
+    state: Arc<RateLimitState>,
 }
 
 impl RateLimitHandle {
@@ -63,6 +69,15 @@ impl RateLimitHandle {
             .iter()
             .map(|r| (r.key().clone(), *r.value()))
             .collect()
+    }
+
+    /// Record additional token usage for a user after the LLM responds.
+    ///
+    /// This updates the per-user token bucket so that TPM limits are enforced
+    /// based on the actual token count returned by the upstream provider.
+    /// The proxy handler calls this post-response with `input_tokens + output_tokens`.
+    pub fn record_tokens(&self, user_id: &str, tokens: u32) {
+        self.state.record_tokens(user_id, tokens);
     }
 }
 
@@ -124,8 +139,8 @@ impl RateLimitLayer {
     ///
     /// Returns a `(layer, handle)` tuple so callers can update overrides at
     /// runtime without restarting. Both the layer and handle share the same
-    /// underlying `Arc<DashMap>`, so changes via the handle are immediately
-    /// visible to in-flight requests.
+    /// underlying `Arc<RateLimitState>`, so token recordings and override
+    /// changes via the handle are immediately visible to in-flight requests.
     ///
     /// - `default_rpm`: Requests per minute for users without an override.
     /// - `default_tpm`: Tokens per minute for users without an override.
@@ -137,17 +152,17 @@ impl RateLimitLayer {
     ) -> (Self, RateLimitHandle) {
         let overrides_map: Arc<DashMap<String, RateLimitSettings>> =
             Arc::new(overrides.into_iter().collect());
+        let state = Arc::new(RateLimitState {
+            default_rpm,
+            default_tpm,
+            overrides: Arc::clone(&overrides_map),
+            buckets: DashMap::new(),
+        });
         let handle = RateLimitHandle {
             overrides: Arc::clone(&overrides_map),
+            state: Arc::clone(&state),
         };
-        let layer = Self {
-            inner: Arc::new(RateLimitState {
-                default_rpm,
-                default_tpm,
-                overrides: overrides_map,
-                buckets: DashMap::new(),
-            }),
-        };
+        let layer = Self { inner: state };
         (layer, handle)
     }
 }
@@ -222,9 +237,8 @@ impl RateLimitState {
     }
 
     /// Update the token count for a user after the actual token usage is known.
-    /// `additional_tokens` is added to the current window; intended to be called
-    /// after the LLM responds with actual usage.
-    #[allow(dead_code)]
+    /// `additional_tokens` is added to the current window; called
+    /// after the LLM responds with actual usage via [`RateLimitHandle::record_tokens`].
     pub fn record_tokens(&self, user_id: &str, additional_tokens: u32) {
         if let Some(mut bucket) = self.buckets.get_mut(user_id) {
             bucket.tokens = bucket.tokens.saturating_add(additional_tokens);
@@ -625,5 +639,28 @@ mod tests {
         svc.ready().await.unwrap();
         let resp = svc.call(req_with_user("carol")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn test_rate_limit_handle_record_tokens_updates_shared_bucket() {
+        // Verify that record_tokens via the handle updates the same state
+        // that check_and_record uses, enabling TPM enforcement.
+        let (layer, handle) = RateLimitLayer::new(100, 50, std::iter::empty());
+        let state = Arc::clone(&layer.inner);
+
+        // Prime the bucket by checking and recording a request (0 tokens).
+        state.check_and_record("dave", 0).unwrap();
+        // Record 30 tokens via handle (simulating post-response token accounting).
+        handle.record_tokens("dave", 30);
+        // After 30 tokens, another request can still pass (30 <= 50).
+        state.check_and_record("dave", 0).unwrap();
+        // Record 25 more tokens (total now 55 > 50).
+        handle.record_tokens("dave", 25);
+        // Now check should fail: 55 + 0 > 50.
+        let result = state.check_and_record("dave", 0);
+        assert!(
+            matches!(result, Err(RateLimitReason::Tpm { .. })),
+            "expected TPM rate limit after accumulating 55 tokens with tpm=50"
+        );
     }
 }

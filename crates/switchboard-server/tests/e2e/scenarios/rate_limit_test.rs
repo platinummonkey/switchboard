@@ -196,57 +196,62 @@ async fn test_e2e_rate_limit_override_for_anonymous_user() {
     );
 }
 
-/// Verifies that the TPM enforcement semantics are consistent with the
-/// implementation.
+/// Verifies that TPM enforcement works end-to-end now that `record_tokens` is
+/// called in the proxy handler after each response.
 ///
-/// # Implementation contract (from rate_limit.rs)
+/// # Scenario
 ///
-/// The `check_and_record` call at request time passes `estimated_tokens = 0`
-/// because the exact token count is only known after the LLM responds.  The
-/// `record_tokens` helper is available to update the bucket post-response, but
-/// it is NOT called in the proxy handler's critical path (it is marked
-/// `#[allow(dead_code)]` in `RateLimitState`).
+/// The mock returns `usage.total_tokens = 15` for every request.
+/// `mock_chat_ok` returns `prompt_tokens=10, completion_tokens=5, total_tokens=15`.
+/// The proxy records `input_tokens + output_tokens = 10 + 5 = 15` tokens
+/// post-response via `RateLimitHandle::record_tokens`.
 ///
-/// As a result, token-based limits configured via `.with_rate_limit(rpm, tpm)`
-/// are enforced only on the *previously accumulated* token total in the
-/// bucket.  Because `estimated_tokens` is always 0 at check time, the bucket's
-/// token count never increases through normal proxy requests, and TPM limits
-/// with `tpm > 0` will never trigger a 429 via the E2E path.
+/// With `rpm = 1000` (generous) and `tpm = 20`:
 ///
-/// This test documents that behaviour and verifies that a server configured
-/// with a tight TPM limit (`tpm = 1`) still allows requests to pass through,
-/// confirming that no spurious TPM-based 429s are generated in the current
-/// implementation.
+/// - Request 1: pre-check sees 0 tokens accumulated → passes.
+///   Post-response: bucket = 15 tokens.
+/// - Request 2: pre-check sees 15 tokens + 0 estimated = 15 ≤ 20 → passes.
+///   Post-response: bucket = 30 tokens.
+/// - Request 3: pre-check sees 30 tokens + 0 estimated = 30 > 20 → **429**.
 ///
-/// When `record_tokens` is wired into the proxy handler in a future phase,
-/// this test should be updated to verify that the TPM limit is enforced after
-/// sufficient token accumulation.
+/// We drive requests until a 429 is observed within a bounded number of
+/// attempts (to tolerate the startup health-check polls consuming some RPM
+/// slots, and to handle any additional health polls before our requests run).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_e2e_tpm_rate_limit_not_enforced_without_record_tokens() {
-    // Configure with rpm=1000 (very generous) and tpm=1 (very tight).
-    // Since estimated_tokens=0 at request time and record_tokens is not
-    // called in the E2E proxy path, the tpm=1 limit should never trigger.
+async fn test_e2e_tpm_rate_limit_enforced_after_record_tokens() {
+    // rpm=1000 so RPM is never the bottleneck; tpm=20 so two requests
+    // (each consuming 15 tokens) should exhaust the token budget.
     let harness = TestHarnessBuilder::new()
         .with_openai()
-        .with_rate_limit(1_000, 1) // tpm=1 would block if tokens were recorded
+        .with_rate_limit(1_000, 20)
         .build()
         .await;
 
     let openai_mock = harness.mocks.openai.as_ref().unwrap();
-    // mock_chat_ok returns usage.total_tokens=15 but record_tokens is not
-    // called in the proxy, so the bucket stays at 0 tokens.
+    // mock_chat_ok returns usage: prompt_tokens=10, completion_tokens=5 → 15 total.
     mock_chat_ok("gpt-4o", "ok").mount(openai_mock).await;
 
-    // Three consecutive requests must all pass despite tpm=1.
-    // The check `bucket.tokens + 0 > 1` is false (0 > 1 is false), so no TPM
-    // rejection occurs.
-    for i in 0..3 {
+    // Drive requests until we observe a 429 (TPM exhausted) or reach the
+    // attempt budget.  Health-check polls during startup hit /health which has
+    // no usage recording, so only proxy requests accumulate tokens.
+    let max_attempts = 10;
+    let mut saw_429 = false;
+    for i in 0..max_attempts {
         let resp = harness.client.chat_completions(chat_body()).await;
+        let status = resp.status().as_u16();
+        if status == 429 {
+            saw_429 = true;
+            break;
+        }
         assert_eq!(
-            resp.status().as_u16(),
-            200,
-            "request {i} must return 200: TPM is not enforced when estimated_tokens=0 \
-             and record_tokens is not called in the proxy path"
+            status, 200,
+            "expected 200 or 429, got {status} on attempt {i}"
         );
     }
+
+    assert!(
+        saw_429,
+        "expected a 429 within {max_attempts} requests: tpm=20 with 15-token responses \
+         should exhaust the token budget after 2 successful requests"
+    );
 }
