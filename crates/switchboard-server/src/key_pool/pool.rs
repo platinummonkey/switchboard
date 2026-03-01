@@ -2,6 +2,8 @@
 
 use crate::key_pool::PooledKey;
 use crate::key_pool::health::KeyStatus;
+use dashmap::DashMap;
+use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use switchboard_common::types::RequestContext;
@@ -19,10 +21,38 @@ const DEGRADED_THRESHOLD: u64 = 5;
 pub struct KeyPool {
     pub(crate) keys: Vec<Arc<RwLock<PooledKey>>>,
     pub(crate) selector: Box<dyn KeySelector>,
+    in_flight: Option<Arc<DashMap<String, AtomicU32>>>,
 }
 impl KeyPool {
     pub fn new(keys: Vec<Arc<RwLock<PooledKey>>>, selector: Box<dyn KeySelector>) -> Self {
-        Self { keys, selector }
+        Self {
+            keys,
+            selector,
+            in_flight: None,
+        }
+    }
+    /// Construct a pool that shares an in-flight tracker with an external
+    /// component (e.g. [`LeastLoadedSelector`]).  The tracker is used by
+    /// [`AuthInjectService`] to increment/decrement in-flight counters around
+    /// each proxied request so the selector always sees live load figures.
+    pub fn new_with_tracker(
+        keys: Vec<Arc<RwLock<PooledKey>>>,
+        selector: Box<dyn KeySelector>,
+        tracker: Option<Arc<DashMap<String, AtomicU32>>>,
+    ) -> Self {
+        Self {
+            keys,
+            selector,
+            in_flight: tracker,
+        }
+    }
+    /// Return a clone of the shared in-flight tracker, if one was registered.
+    ///
+    /// Returns `Some` only for pools that use [`LeastLoadedSelector`] (or any
+    /// other selector that was wired with a tracker at construction time).
+    /// Returns `None` for all other pools — callers treat that as "no-op".
+    pub fn in_flight_tracker(&self) -> Option<Arc<DashMap<String, AtomicU32>>> {
+        self.in_flight.clone()
     }
     pub fn len(&self) -> usize {
         self.keys.len()
@@ -363,5 +393,65 @@ mod tests {
         for h in hs {
             h.join().unwrap();
         }
+    }
+
+    // ── in_flight_tracker wiring tests ──────────────────────────────────────
+
+    #[test]
+    fn test_in_flight_tracker_none_for_plain_pool() {
+        let p = pool(vec![mk("k1")]);
+        assert!(p.in_flight_tracker().is_none());
+    }
+
+    #[test]
+    fn test_in_flight_tracker_some_when_tracker_provided() {
+        use crate::key_pool::selector::LeastLoadedSelector;
+
+        let sel = LeastLoadedSelector::new();
+        let tracker = sel.in_flight_tracker();
+        let p = KeyPool::new_with_tracker(vec![mk("k1"), mk("k2")], Box::new(sel), Some(tracker));
+        assert!(p.in_flight_tracker().is_some());
+    }
+
+    /// Simulate what `AuthInjectService` does: after `select()` returns a key,
+    /// increment the shared tracker.  Verify the counter is 1 and that a
+    /// subsequent `select()` on the same pool now prefers the other key.
+    #[test]
+    fn test_in_flight_counter_incremented_via_tracker_shifts_selection() {
+        use crate::key_pool::selector::LeastLoadedSelector;
+        use std::sync::atomic::Ordering;
+
+        let sel = LeastLoadedSelector::new();
+        let tracker = sel.in_flight_tracker();
+        let p = KeyPool::new_with_tracker(
+            vec![mk("k1"), mk("k2")],
+            Box::new(sel),
+            Some(Arc::clone(&tracker)),
+        );
+
+        // First selection — no load recorded yet, should return k1 (first).
+        let first = p.select(&RequestContext::default()).unwrap();
+        let key_id = first.read().unwrap().id.clone();
+        assert_eq!(key_id, "k1");
+
+        // Simulate AuthInjectService incrementing the counter for the selected key.
+        let pool_tracker = p.in_flight_tracker().unwrap();
+        pool_tracker
+            .entry(key_id.clone())
+            .or_insert_with(|| AtomicU32::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+
+        // Counter for k1 should now be 1.
+        assert_eq!(pool_tracker.get("k1").unwrap().load(Ordering::Relaxed), 1);
+
+        // Second selection — k1 has 1 in-flight, k2 has 0, so k2 is selected.
+        let second = p.select(&RequestContext::default()).unwrap();
+        assert_eq!(second.read().unwrap().id, "k2");
+
+        // Simulate decrement (request complete).
+        if let Some(entry) = pool_tracker.get("k1") {
+            entry.fetch_sub(1, Ordering::Relaxed);
+        }
+        assert_eq!(pool_tracker.get("k1").unwrap().load(Ordering::Relaxed), 0);
     }
 }

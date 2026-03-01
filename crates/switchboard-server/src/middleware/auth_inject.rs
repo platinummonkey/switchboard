@@ -3,10 +3,12 @@
 use crate::key_pool::{KeyPool, PooledKey};
 use crate::middleware::model_override::ProviderName;
 use axum::body::Body;
+use dashmap::DashMap;
 use http::{Request, Response};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 use switchboard_common::types::RequestContext;
@@ -88,9 +90,31 @@ where
                 Some(key_arc) => {
                     let key_id = key_arc.read().unwrap().id.clone();
                     tracing::debug!(provider = %provider_name, key_id = %key_id, "auth_inject: selected key");
+
+                    // Grab the in-flight tracker (Some only for LeastLoaded pools).
+                    let tracker: Option<Arc<DashMap<String, AtomicU32>>> = pool.in_flight_tracker();
+
+                    // Increment before forwarding so the counter is non-zero
+                    // for the entire duration of the upstream request.
+                    if let Some(ref t) = tracker {
+                        t.entry(key_id.clone())
+                            .or_insert_with(|| AtomicU32::new(0))
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+
                     let mut req = req;
+                    let key_id_for_decrement = key_id.clone();
                     req.extensions_mut().insert(SelectedKeyId(key_id));
-                    inner.call(req).await
+
+                    // Wrap the call so we decrement regardless of whether the
+                    // upstream returns Ok or Err.
+                    let result = inner.call(req).await;
+                    if let Some(t) = tracker {
+                        if let Some(entry) = t.get(&key_id_for_decrement) {
+                            entry.fetch_sub(1, Ordering::Relaxed);
+                        }
+                    }
+                    result
                 }
                 None => {
                     tracing::debug!(provider = %provider_name, "auth_inject: no eligible key");

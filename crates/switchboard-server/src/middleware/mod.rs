@@ -1,16 +1,18 @@
 //! Tower middleware stack for switchboard-server.
 //!
-//! # Layers (innermost → outermost, i.e. applied in reverse order)
+//! # Layers (outermost → innermost, i.e. request traversal order)
 //!
 //! 1. [`request_id::RequestIdLayer`] — generates / propagates
 //!    `X-Switchboard-Request-Id` on every request.
-//! 2. [`model_override::ModelOverrideLayer`] — resolves the model and provider
-//!    for proxy requests; sets [`model_override::ResolvedModel`],
-//!    [`model_override::ProviderName`], and [`model_override::SelectionReasonExt`]
-//!    in extensions.
-//! 3. [`auth_layer::AuthLayer`] — validates `Authorization` header via
+//! 2. [`auth_layer::AuthLayer`] — validates `Authorization` header via
 //!    [`crate::auth::registry::AuthRegistry`]; injects [`crate::auth::validator::ValidatedClient`]
 //!    into request extensions.  Returns 401 on failure.
+//! 3. [`model_override::ModelOverrideLayer`] — resolves the model and provider
+//!    for proxy requests; sets [`model_override::ResolvedModel`],
+//!    [`model_override::ProviderName`], and [`model_override::SelectionReasonExt`]
+//!    in extensions.  Reads `ValidatedClient.user_id` (injected by the auth
+//!    layer) so that per-user model overrides fire for api-key-mapped users
+//!    even when no explicit `x-switchboard-user` header is present.
 //! 4. [`rate_limit::RateLimitLayer`] — token-bucket rate limiter per user.
 //!    Returns 429 when limits are exceeded.
 //! 5. [`auth_inject::AuthInjectLayer`] — selects a key from the matching
@@ -21,8 +23,14 @@
 //!
 //! # Layer ordering rationale
 //!
-//! - `ModelOverrideLayer` runs before `AuthLayer` so the provider name is
-//!   known for the entire request lifecycle (including auth errors).
+//! - `AuthLayer` runs before `ModelOverrideLayer` so that `ValidatedClient`
+//!   (with the resolved `user_id` from api-key mappings) is available when the
+//!   model selector evaluates per-user overrides.  This is the key enabler for
+//!   api-key-authenticated users to receive per-user model policies without
+//!   needing an explicit `x-switchboard-user` header.
+//! - `ModelOverrideLayer` runs after `AuthLayer` so it can read the
+//!   `ValidatedClient` extension and fall back to `ValidatedClient.user_id`
+//!   when the `x-switchboard-user` header is absent.
 //! - `AuthInjectLayer` runs after `AuthLayer` so `ValidatedClient` is available
 //!   for user-aware key-selection strategies (e.g. sticky selectors).
 //! - `GuardrailLayer` wraps closest to the handler so it sees the final
@@ -131,7 +139,11 @@ impl std::fmt::Debug for MiddlewareConfig {
 /// [`build_middleware_stack`].
 ///
 /// Layer order (outermost → innermost, i.e. request traversal order):
-/// `RequestIdLayer → ModelOverrideLayer → AuthLayer → RateLimitLayer → AuthInjectLayer`
+/// `RequestIdLayer → AuthLayer → ModelOverrideLayer → RateLimitLayer → AuthInjectLayer`
+///
+/// `AuthLayer` runs before `ModelOverrideLayer` so that `ValidatedClient`
+/// (carrying `user_id` resolved from api-key mappings) is available when the
+/// model selector evaluates per-user overrides.
 ///
 /// The optional [`GuardrailLayer`] is applied on the router directly when
 /// `cfg.guardrail_pipeline` is `Some` — it is not included in this type alias
@@ -141,9 +153,9 @@ pub type MiddlewareStack = tower::layer::util::Stack<
     tower::layer::util::Stack<
         RateLimitLayer,
         tower::layer::util::Stack<
-            AuthLayer,
+            ModelOverrideLayer,
             tower::layer::util::Stack<
-                ModelOverrideLayer,
+                AuthLayer,
                 tower::layer::util::Stack<RequestIdLayer, tower::layer::util::Identity>,
             >,
         >,
@@ -158,8 +170,11 @@ pub type MiddlewareStack = tower::layer::util::Stack<
 /// - `stack` is a [`ServiceBuilder`] with the following layers applied
 ///   (outermost first, i.e. the order in which a request passes through):
 ///   1. `RequestIdLayer` — assign / propagate request ID
-///   2. `ModelOverrideLayer` — resolve model and provider
-///   3. `AuthLayer` — validate client credentials
+///   2. `AuthLayer` — validate client credentials; injects [`crate::auth::validator::ValidatedClient`]
+///      (with `user_id` resolved from api-key mappings) into extensions.
+///   3. `ModelOverrideLayer` — resolve model and provider; reads `ValidatedClient.user_id`
+///      as a fallback when the `x-switchboard-user` header is absent, enabling
+///      per-user model overrides for api-key-authenticated users.
 ///   4. `RateLimitLayer` — enforce per-user rate limits
 ///   5. `AuthInjectLayer` — select upstream key
 /// - `handle` is a [`RateLimitHandle`] that allows live updates to rate-limit
@@ -181,14 +196,19 @@ pub fn build_middleware_stack(
         RateLimitLayer::new(cfg.default_rpm, cfg.default_tpm, cfg.rate_limit_overrides)
     });
 
+    // AuthLayer runs before ModelOverrideLayer so that ValidatedClient
+    // (carrying user_id resolved from api-key mappings by StaticKeyValidator)
+    // is available in extensions when the model selector evaluates per-user
+    // overrides.  ModelOverrideLayer reads ValidatedClient.user_id as a
+    // fallback when no explicit x-switchboard-user header is present.
     let stack = ServiceBuilder::new()
         .layer(RequestIdLayer)
+        .layer(AuthLayer::new(cfg.auth_registry))
         .layer(ModelOverrideLayer::new(
             cfg.model_selector,
             cfg.provider_registry,
             cfg.providers_config,
         ))
-        .layer(AuthLayer::new(cfg.auth_registry))
         .layer(rate_limit_layer)
         .layer(AuthInjectLayer::new(cfg.key_pools));
     (stack, handle)

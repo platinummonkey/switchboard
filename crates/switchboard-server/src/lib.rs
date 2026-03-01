@@ -104,16 +104,41 @@ impl crate::auth::AuthProvider for VaultAuthAdapter {
 ///
 /// Iterates `config.auth.validators` and registers each supported validator
 /// type.  Unknown types are logged as warnings and skipped.
+///
+/// For `static_keys` validators, api-key → user-identity mappings from
+/// `config.identity.api_key_mappings` are forwarded to the validator so that
+/// requests authenticated via a static key automatically resolve a `user_id`
+/// on the returned [`crate::auth::validator::ValidatedClient`].  This allows
+/// per-user model overrides (`ModelSelectionConfig.overrides`) and other
+/// identity-aware policies to fire for api-key-mapped users without requiring
+/// an explicit `x-switchboard-user` header.
 pub fn build_auth_registry(
     config: &crate::config::ServerConfig,
 ) -> crate::auth::registry::AuthRegistry {
     let mut builder = AuthRegistryBuilder::default();
 
+    // Build the user_map once from identity.api_key_mappings so it can be
+    // shared across all static_keys validators (most configs have only one).
+    let user_map: std::collections::HashMap<String, (String, Option<String>)> = config
+        .identity
+        .api_key_mappings
+        .iter()
+        .map(|m| (m.api_key.clone(), (m.user_id.clone(), m.team.clone())))
+        .collect();
+
     for (name, entry) in &config.auth.validators {
         match entry.validator_type.as_str() {
             "static_keys" => {
-                builder = builder.add(StaticKeyValidator::new(name, entry.keys.clone()));
-                tracing::info!(validator = name, "registered static_keys auth validator");
+                builder = builder.add(StaticKeyValidator::new_with_mappings(
+                    name,
+                    entry.keys.clone(),
+                    user_map.clone(),
+                ));
+                tracing::info!(
+                    validator = name,
+                    mapped_identities = user_map.len(),
+                    "registered static_keys auth validator"
+                );
             }
             "jwt" => {
                 tracing::warn!(
@@ -356,14 +381,25 @@ pub async fn build_providers(
             }
         }
 
-        let selector: Box<dyn KeySelector> = match provider_cfg.key_pool.selector.as_str() {
-            "round_robin" => Box::new(RoundRobinSelector::new()),
-            "least_loaded" => Box::new(LeastLoadedSelector::new()),
-            "sticky" => Box::new(StickySelector::new(Box::new(RoundRobinSelector::new()))),
-            _ => Box::new(WeightedRandomSelector),
-        };
+        // For the least_loaded selector we need to share the in-flight tracker
+        // between the selector (which reads it to pick the minimum) and the
+        // KeyPool (which exposes it to AuthInjectService for write access).
+        let (selector, tracker): (Box<dyn KeySelector>, _) =
+            match provider_cfg.key_pool.selector.as_str() {
+                "round_robin" => (Box::new(RoundRobinSelector::new()), None),
+                "least_loaded" => {
+                    let s = LeastLoadedSelector::new();
+                    let t = s.in_flight_tracker();
+                    (Box::new(s), Some(t))
+                }
+                "sticky" => (
+                    Box::new(StickySelector::new(Box::new(RoundRobinSelector::new()))),
+                    None,
+                ),
+                _ => (Box::new(WeightedRandomSelector), None),
+            };
 
-        let pool = KeyPool::new(keys, selector);
+        let pool = KeyPool::new_with_tracker(keys, selector, tracker);
         pools.insert(name.clone(), Arc::new(pool));
         tracing::info!(provider = name, "built key pool");
     }
@@ -597,10 +633,19 @@ pub async fn run_server(
     tracing::info!(addr = %listen_addr, "listening");
 
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(async move {
+            // Wait for the caller's shutdown signal (SIGTERM / Ctrl-C / test oneshot).
+            shutdown.await;
+            // Drain: keep existing connections alive until they finish or the
+            // configured timeout expires, then close everything.
+            tracing::info!(
+                drain_secs = shutdown_timeout.as_secs_f64(),
+                "graceful shutdown: draining in-flight requests"
+            );
+            tokio::time::sleep(shutdown_timeout).await;
+        })
         .await?;
 
-    let _ = shutdown_timeout; // retain for future use in drain logic
     tracing::info!("server shut down cleanly");
     Ok(())
 }
