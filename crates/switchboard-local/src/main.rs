@@ -287,36 +287,43 @@ async fn cmd_status() -> Result<(), LocalError> {
             println!("Auth        : ERROR — {e}");
         }
         Ok(manager) => {
-            match manager.get_header().await {
-                Err(e) => {
-                    println!("Auth        : ERROR — {e}");
-                }
-                Ok((name, value)) => {
-                    // Try a GET /health against the server.
-                    let client = reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(5))
-                        .build();
-
-                    match client {
-                        Err(e) => println!("HTTP client : ERROR — {e}"),
-                        Ok(client) => {
-                            let health_url =
-                                format!("{}/health", config.server.url.trim_end_matches('/'));
-                            let resp = client.get(&health_url).header(name, value).send().await;
-
-                            match resp {
-                                Ok(r) if r.status().is_success() => {
-                                    println!("Server      : OK ({})", r.status());
-                                }
-                                Ok(r) => {
-                                    println!("Server      : reachable but returned {}", r.status());
-                                }
-                                Err(e) => {
-                                    println!("Server      : UNREACHABLE — {e}");
-                                }
-                            }
-                        }
+            // For mTLS, no Authorization header is needed — the TLS client
+            // certificate carries the identity.  Use the auth-aware client
+            // (which embeds the cert) for the health check instead.
+            let auth_header = if manager.needs_auth_header() {
+                match manager.get_header().await {
+                    Err(e) => {
+                        println!("Auth        : ERROR — {e}");
+                        return Ok(());
                     }
+                    Ok(pair) => Some(pair),
+                }
+            } else {
+                println!("Auth        : mTLS (client certificate)");
+                None
+            };
+
+            // Try a GET /health against the server using the auth-aware client.
+            // For mTLS, build_client() returns the TLS-configured client
+            // (with the embedded certificate); for other modes it is a plain client.
+            let client = manager.build_client();
+
+            let health_url = format!("{}/health", config.server.url.trim_end_matches('/'));
+            let mut req = client.get(&health_url);
+            if let Some((name, value)) = auth_header {
+                req = req.header(name, value);
+            }
+            let resp = req.send().await;
+
+            match resp {
+                Ok(r) if r.status().is_success() => {
+                    println!("Server      : OK ({})", r.status());
+                }
+                Ok(r) => {
+                    println!("Server      : reachable but returned {}", r.status());
+                }
+                Err(e) => {
+                    println!("Server      : UNREACHABLE — {e}");
                 }
             }
         }

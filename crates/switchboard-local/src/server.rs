@@ -38,9 +38,11 @@ impl LocalServer {
         let auth_manager = LocalAuthManager::new(&config.auth).await?;
         let model_prefs = ModelPrefs::from_config(&config.model);
 
-        let client = reqwest::Client::builder()
-            .build()
-            .map_err(|e| LocalError::Config(format!("failed to build HTTP client: {e}")))?;
+        // For mTLS, `build_client()` returns the TLS-configured client (with
+        // the embedded client certificate + trusted server CA).  For all other
+        // auth methods it returns a plain default client; auth is carried via
+        // the `Authorization` header injected in `forward_request`.
+        let client = auth_manager.build_client();
 
         Ok(Self {
             config,

@@ -57,6 +57,8 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 http = "1"
 libc = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 # Config parsing (also needed at runtime for load())
 toml = { workspace = true }
@@ -67,3 +69,4 @@ tokio = { workspace = true }
 tempfile = "3"
 switchboard-server = { path = "../switchboard-server", default-features = false }
 axum = { workspace = true }
+rcgen = { workspace = true }

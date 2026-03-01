@@ -144,6 +144,20 @@ pub struct ServerListenConfig {
 
     #[serde(default = "default_shutdown_timeout")]
     pub graceful_shutdown_timeout: String,
+
+    /// Path to PEM-encoded TLS certificate for the server.
+    /// When set together with `tls_key_path`, the proxy listens on HTTPS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_cert_path: Option<String>,
+
+    /// Path to PEM-encoded private key for the TLS certificate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tls_key_path: Option<String>,
+
+    /// Path to PEM-encoded CA certificate for verifying client certificates.
+    /// When set, mutual TLS is required.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mtls_ca_path: Option<String>,
 }
 
 impl Default for ServerListenConfig {
@@ -151,6 +165,9 @@ impl Default for ServerListenConfig {
         Self {
             listen: default_listen(),
             graceful_shutdown_timeout: default_shutdown_timeout(),
+            tls_cert_path: None,
+            tls_key_path: None,
+            mtls_ca_path: None,
         }
     }
 }

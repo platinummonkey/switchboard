@@ -7,7 +7,8 @@
 //! - `api_key` — returns `Authorization: Bearer <key>` from config
 //! - `jwt` — uses a static token or runs a shell command to fetch one; background
 //!   refresh loop re-runs the command before the token expires
-//! - `mtls` — stub (deferred to a later phase)
+//! - `mtls` — builds a `reqwest::Client` with a client certificate + server CA.
+//!   No `Authorization` header is produced; TLS mutual auth carries the identity.
 //! - `oauth` — OAuth2 client_credentials grant with background token refresh
 
 use std::sync::Arc;
@@ -207,8 +208,10 @@ pub struct LocalAuthManager {
 enum Inner {
     ApiKey(String),
     Jwt(JwtState),
-    /// Stub — deferred to a later phase.
-    Mtls,
+    /// mTLS — client certificate is embedded in the `reqwest::Client`.
+    /// No `Authorization` header is produced; identity is carried in the TLS
+    /// handshake and extracted by the server's `MtlsCnResolver`.
+    Mtls(reqwest::Client),
     /// OAuth2 client_credentials grant.
     OAuth(OAuthState),
 }
@@ -271,8 +274,63 @@ impl LocalAuthManager {
             }
 
             "mtls" => {
-                tracing::warn!("local auth: mTLS mode is not yet implemented in switchboard-local");
-                Ok(Self { inner: Inner::Mtls })
+                let mtls_cfg = &config.mtls;
+
+                // Read client certificate PEM.
+                let cert_pem = tokio::fs::read(&mtls_cfg.cert).await.map_err(|e| {
+                    LocalError::Auth(format!(
+                        "mTLS: cannot read client cert '{}': {e}",
+                        mtls_cfg.cert
+                    ))
+                })?;
+
+                // Read client private key PEM.
+                let key_pem = tokio::fs::read(&mtls_cfg.key).await.map_err(|e| {
+                    LocalError::Auth(format!(
+                        "mTLS: cannot read client key '{}': {e}",
+                        mtls_cfg.key
+                    ))
+                })?;
+
+                // Read server CA certificate PEM.
+                let ca_pem = tokio::fs::read(&mtls_cfg.ca).await.map_err(|e| {
+                    LocalError::Auth(format!(
+                        "mTLS: cannot read server CA cert '{}': {e}",
+                        mtls_cfg.ca
+                    ))
+                })?;
+
+                // Build identity from cert + key concatenated as PEM.
+                // reqwest::Identity::from_pem accepts cert + PKCS8/RSA private key in one PEM blob.
+                let mut identity_pem = cert_pem.clone();
+                identity_pem.extend_from_slice(&key_pem);
+                let identity = reqwest::Identity::from_pem(&identity_pem).map_err(|e| {
+                    LocalError::Auth(format!("mTLS: failed to build client identity: {e}"))
+                })?;
+
+                let ca_cert = reqwest::Certificate::from_pem(&ca_pem).map_err(|e| {
+                    LocalError::Auth(format!("mTLS: failed to parse server CA cert: {e}"))
+                })?;
+
+                let client = reqwest::Client::builder()
+                    .use_rustls_tls()
+                    .identity(identity)
+                    .add_root_certificate(ca_cert)
+                    .build()
+                    .map_err(|e| {
+                        LocalError::Auth(format!("mTLS: failed to build TLS client: {e}"))
+                    })?;
+
+                tracing::info!(
+                    cert = %mtls_cfg.cert,
+                    key = %mtls_cfg.key,
+                    ca = %mtls_cfg.ca,
+                    "local auth: mTLS client certificate loaded"
+                );
+
+                Ok(Self {
+                    inner: Inner::Mtls(client),
+                })
             }
 
             "oauth" => {
@@ -345,6 +403,11 @@ impl LocalAuthManager {
 
     /// Returns the `(header_name, header_value)` pair to inject into outgoing
     /// requests to `switchboard-server`.
+    ///
+    /// Returns `Err` only when the credentials are genuinely unavailable (e.g.
+    /// a token command fails).  For mTLS, the identity is carried in the TLS
+    /// layer; callers should use [`LocalAuthManager::needs_auth_header`] to
+    /// determine whether to call this method at all.
     pub async fn get_header(&self) -> Result<(String, String), LocalError> {
         match &self.inner {
             Inner::ApiKey(key) => Ok(("Authorization".into(), format!("Bearer {key}"))),
@@ -354,14 +417,37 @@ impl LocalAuthManager {
                 Ok(("Authorization".into(), format!("Bearer {token}")))
             }
 
-            Inner::Mtls => Err(LocalError::Auth(
-                "mTLS auth is not yet implemented; cannot produce a header".into(),
+            // mTLS: the client certificate is already in the reqwest::Client.
+            // Callers should check needs_auth_header() before calling this.
+            Inner::Mtls(_) => Err(LocalError::Auth(
+                "mTLS auth does not use an Authorization header; \
+                 identity is carried in the TLS client certificate"
+                    .into(),
             )),
 
             Inner::OAuth(state) => {
                 let token = state.token.read().await.clone();
                 Ok(("authorization".into(), format!("Bearer {token}")))
             }
+        }
+    }
+
+    /// Returns `true` when an `Authorization` header should be injected into
+    /// outgoing requests.  Returns `false` for mTLS, where the identity is
+    /// carried in the TLS client certificate and no header is needed.
+    pub fn needs_auth_header(&self) -> bool {
+        !matches!(self.inner, Inner::Mtls(_))
+    }
+
+    /// Returns a `reqwest::Client` pre-configured for this auth method.
+    ///
+    /// For mTLS, this is the client that carries the embedded client certificate
+    /// and trusts the server CA.  For all other methods a plain default client
+    /// is returned (auth is handled via request headers instead).
+    pub fn build_client(&self) -> reqwest::Client {
+        match &self.inner {
+            Inner::Mtls(client) => client.clone(),
+            _ => reqwest::Client::new(),
         }
     }
 
@@ -392,9 +478,8 @@ impl LocalAuthManager {
                 }
             }
 
-            Inner::Mtls => Err(LocalError::Auth(
-                "mTLS auth is not yet implemented; cannot refresh".into(),
-            )),
+            // mTLS: certificates are loaded at startup; no runtime refresh.
+            Inner::Mtls(_) => Ok(()),
 
             Inner::OAuth(state) => {
                 tracing::info!(
@@ -745,16 +830,80 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // ── stub modes ────────────────────────────────────────────────────────────
+    // ── mTLS mode ─────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn test_mtls_mode_get_header_returns_error() {
+    async fn test_mtls_mode_missing_cert_files_returns_error() {
+        // Default MtlsAuthConfig has empty string paths — file reads will fail.
         let config = AuthConfig {
             method: "mtls".into(),
             ..AuthConfig::default()
         };
+        let result = LocalAuthManager::new(&config).await;
+        assert!(
+            result.is_err(),
+            "expected error when cert/key/ca files do not exist"
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("mTLS"),
+            "error message should mention mTLS; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mtls_mode_needs_no_auth_header() {
+        use crate::config::MtlsAuthConfig;
+        use std::io::Write;
+        use tempfile::NamedTempFile;
+
+        // Generate a minimal self-signed cert + key with rcgen so the test
+        // does not require external files.
+        let cert_key = rcgen::generate_simple_self_signed(vec!["localhost".into()])
+            .expect("rcgen generate failed");
+
+        let cert_pem = cert_key.cert.pem();
+        let key_pem = cert_key.key_pair.serialize_pem();
+
+        let mut cert_file = NamedTempFile::new().unwrap();
+        cert_file.write_all(cert_pem.as_bytes()).unwrap();
+
+        let mut key_file = NamedTempFile::new().unwrap();
+        key_file.write_all(key_pem.as_bytes()).unwrap();
+
+        // Use the same cert as the CA (self-signed).
+        let mut ca_file = NamedTempFile::new().unwrap();
+        ca_file.write_all(cert_pem.as_bytes()).unwrap();
+
+        let config = AuthConfig {
+            method: "mtls".into(),
+            mtls: MtlsAuthConfig {
+                cert: cert_file.path().to_str().unwrap().into(),
+                key: key_file.path().to_str().unwrap().into(),
+                ca: ca_file.path().to_str().unwrap().into(),
+            },
+            ..AuthConfig::default()
+        };
+
         let manager = LocalAuthManager::new(&config).await.unwrap();
-        assert!(manager.get_header().await.is_err());
+
+        // mTLS identity is in the TLS layer — no Authorization header needed.
+        assert!(
+            !manager.needs_auth_header(),
+            "mTLS should report that no Authorization header is needed"
+        );
+
+        // get_header() returns Err for mTLS (callers must check needs_auth_header()).
+        assert!(
+            manager.get_header().await.is_err(),
+            "mTLS get_header() should return Err (use needs_auth_header() first)"
+        );
+
+        // refresh() is a no-op for mTLS (cert files are loaded at startup).
+        assert!(manager.refresh().await.is_ok());
+
+        // build_client() returns the TLS-configured reqwest::Client.
+        let _client = manager.build_client();
     }
 
     #[tokio::test]

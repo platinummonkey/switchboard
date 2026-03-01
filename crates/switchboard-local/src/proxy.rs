@@ -53,17 +53,23 @@ pub async fn forward_request(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    // 1. Obtain auth header — 401 if unavailable.
-    let (auth_name, auth_value) = match state.auth_manager.get_header().await {
-        Ok(pair) => pair,
-        Err(e) => {
-            tracing::warn!(error = %e, "local proxy: auth header unavailable");
-            return (
-                StatusCode::UNAUTHORIZED,
-                format!("authentication unavailable: {e}"),
-            )
-                .into_response();
+    // 1. Obtain auth header.
+    // For mTLS, no Authorization header is needed — the TLS client certificate
+    // carries the identity.  Skip header injection in that case.
+    let auth_header = if state.auth_manager.needs_auth_header() {
+        match state.auth_manager.get_header().await {
+            Ok(pair) => Some(pair),
+            Err(e) => {
+                tracing::warn!(error = %e, "local proxy: auth header unavailable");
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    format!("authentication unavailable: {e}"),
+                )
+                    .into_response();
+            }
         }
+    } else {
+        None
     };
 
     // 2. Possibly rewrite the body (model overrides + default model injection).
@@ -95,7 +101,10 @@ pub async fn forward_request(
     }
 
     // Auth header (overrides whatever the client sent).
-    req_builder = req_builder.header(auth_name.as_str(), auth_value.as_str());
+    // For mTLS, auth_header is None — the TLS client certificate carries identity.
+    if let Some((auth_name, auth_value)) = &auth_header {
+        req_builder = req_builder.header(auth_name.as_str(), auth_value.as_str());
+    }
 
     // Identity headers.
     if let Some(user) = &state.config.identity.user {

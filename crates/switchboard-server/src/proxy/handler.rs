@@ -24,7 +24,7 @@ use crate::config::IdentityConfig;
 use crate::config::ServerConfig;
 use crate::identity::{
     ApiKeyMappingResolver, HeaderResolver, IdentityChain, IdentitySource, JwtClaimResolver,
-    ToolSpecificResolver, UserIdentity,
+    MtlsClientCn, MtlsCnResolver, ToolSpecificResolver, UserIdentity,
 };
 use crate::key_pool::KeyPool;
 use crate::middleware::model_override::ResolvedModel;
@@ -62,6 +62,7 @@ pub async fn chat_completions(
     State(state): State<Arc<AppState>>,
     Extension(validated_client): Extension<ValidatedClient>,
     resolved_model_ext: Option<Extension<ResolvedModel>>,
+    mtls_cn_ext: Option<Extension<MtlsClientCn>>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
@@ -95,11 +96,13 @@ pub async fn chat_completions(
         None => return ProxyError::NoKey(provider_name).into_response(),
     };
 
+    let mtls_cn = mtls_cn_ext.as_ref().map(|Extension(cn)| cn);
     let ctx = build_request_context(
         &validated_client,
         &headers,
         &state.config.identity,
         Some(resolved_model.clone()),
+        mtls_cn,
     )
     .await;
 
@@ -154,6 +157,7 @@ pub async fn anthropic_messages(
     State(state): State<Arc<AppState>>,
     Extension(validated_client): Extension<ValidatedClient>,
     resolved_model_ext: Option<Extension<ResolvedModel>>,
+    mtls_cn_ext: Option<Extension<MtlsClientCn>>,
     headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Response {
@@ -187,11 +191,13 @@ pub async fn anthropic_messages(
         None => return ProxyError::NoKey(provider_name).into_response(),
     };
 
+    let mtls_cn = mtls_cn_ext.as_ref().map(|Extension(cn)| cn);
     let ctx = build_request_context(
         &validated_client,
         &headers,
         &state.config.identity,
         Some(resolved_model.clone()),
+        mtls_cn,
     )
     .await;
 
@@ -310,6 +316,10 @@ fn build_identity_chain(config: &IdentityConfig) -> IdentityChain {
                 );
                 resolvers.push(Box::new(ApiKeyMappingResolver::new(mapping)));
             }
+            "mtls_cn" => {
+                resolvers.push(Box::new(MtlsCnResolver));
+                tracing::info!("registered mtls_cn identity resolver");
+            }
             // ToolSpecificResolver is already prepended above; skip duplicates.
             "tool" => {}
             _ => {
@@ -340,11 +350,16 @@ fn strip_bearer_prefix(value: &str) -> &str {
 ///
 /// Injects the raw API key (without "Bearer " prefix) into
 /// `switchboard_headers["__api_key"]` so [`ApiKeyMappingResolver`] can find it.
+///
+/// If `mtls_cn` is `Some`, the Common Name is also injected into
+/// `switchboard_headers` under [`crate::identity::mtls_cn::MTLS_CN_HEADER`]
+/// so that [`crate::identity::MtlsCnResolver`] can read it.
 async fn build_request_context(
     validated_client: &ValidatedClient,
     headers: &HeaderMap,
     identity_config: &IdentityConfig,
     model: Option<String>,
+    mtls_cn: Option<&MtlsClientCn>,
 ) -> RequestContext {
     let mut ctx = RequestContext::new();
     ctx.model = model;
@@ -373,6 +388,16 @@ async fn build_request_context(
                 );
             }
         }
+    }
+
+    // Inject the mTLS client certificate Common Name so MtlsCnResolver can
+    // read it from the RequestContext without needing direct access to axum
+    // extensions.
+    if let Some(MtlsClientCn(cn)) = mtls_cn {
+        ctx.switchboard_headers.insert(
+            crate::identity::mtls_cn::MTLS_CN_HEADER.to_string(),
+            cn.clone(),
+        );
     }
 
     let chain = build_identity_chain(identity_config);
@@ -958,7 +983,7 @@ mod tests {
             HeaderValue::from_static("Bearer sk-team-alice-key"),
         );
 
-        let ctx = build_request_context(&validated_client, &headers, &config, None).await;
+        let ctx = build_request_context(&validated_client, &headers, &config, None, None).await;
 
         assert_eq!(
             ctx.user_id.as_deref(),
@@ -997,7 +1022,7 @@ mod tests {
             HeaderValue::from_static("Bearer sk-other-key"),
         );
 
-        let ctx = build_request_context(&validated_client, &headers, &config, None).await;
+        let ctx = build_request_context(&validated_client, &headers, &config, None, None).await;
 
         assert!(
             ctx.user_id.is_none(),
@@ -1038,6 +1063,7 @@ mod tests {
             &headers,
             &identity_config,
             Some("gpt-4o".into()),
+            None,
         )
         .await;
 
@@ -1069,7 +1095,8 @@ mod tests {
             api_key_mappings: vec![],
         };
 
-        let ctx = build_request_context(&validated_client, &headers, &identity_config, None).await;
+        let ctx =
+            build_request_context(&validated_client, &headers, &identity_config, None, None).await;
 
         assert_eq!(ctx.user_id.as_deref(), Some("header-user@example.com"));
     }
@@ -1092,7 +1119,8 @@ mod tests {
         );
 
         let identity_config = IdentityConfig::default();
-        let ctx = build_request_context(&validated_client, &headers, &identity_config, None).await;
+        let ctx =
+            build_request_context(&validated_client, &headers, &identity_config, None, None).await;
 
         assert_eq!(
             ctx.switchboard_headers

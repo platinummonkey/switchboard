@@ -16,6 +16,7 @@ pub mod observability;
 pub mod providers;
 pub mod proxy;
 pub mod routing;
+pub mod tls;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -436,6 +437,10 @@ pub async fn run_server(
     let shutdown_timeout = crate::config::duration::parse(&config.server.graceful_shutdown_timeout)
         .unwrap_or(std::time::Duration::from_secs(30));
 
+    // Clone the listen config before config is moved into Arc<AppState>.
+    // Needed to call build_tls_acceptor after AppState is constructed.
+    let server_listen_config = config.server.clone();
+
     // Extract sub-configs needed for middleware before server_config is
     // moved into AppState.
     let auth_registry = build_auth_registry(&config);
@@ -629,22 +634,106 @@ pub async fn run_server(
     let router = router.layer(stack);
     tracing::info!("middleware stack applied");
 
-    let listen_addr = listener.local_addr()?;
-    tracing::info!(addr = %listen_addr, "listening");
+    // Try to build a TLS acceptor.  If TLS is not configured `tls_acceptor` is
+    // `None` and we fall through to the plain-TCP path.
+    let tls_acceptor = crate::tls::build_tls_acceptor(&server_listen_config).await?;
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            // Wait for the caller's shutdown signal (SIGTERM / Ctrl-C / test oneshot).
-            shutdown.await;
-            // Drain: keep existing connections alive until they finish or the
-            // configured timeout expires, then close everything.
-            tracing::info!(
-                drain_secs = shutdown_timeout.as_secs_f64(),
-                "graceful shutdown: draining in-flight requests"
-            );
-            tokio::time::sleep(shutdown_timeout).await;
-        })
-        .await?;
+    if let Some(acceptor) = tls_acceptor {
+        // TLS/mTLS path: custom accept loop using tokio-rustls + hyper-util.
+        use hyper_util::rt::{TokioExecutor, TokioIo};
+        use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
+
+        let auto_builder = AutoConnBuilder::new(TokioExecutor::new());
+        let listen_addr = listener.local_addr()?;
+        tracing::info!(addr = %listen_addr, "listening (TLS)");
+
+        let shutdown = std::pin::pin!(shutdown);
+        let mut shutdown = shutdown;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => {
+                    tracing::info!(
+                        drain_secs = shutdown_timeout.as_secs_f64(),
+                        "TLS server: graceful shutdown, draining in-flight requests"
+                    );
+                    tokio::time::sleep(shutdown_timeout).await;
+                    break;
+                }
+                result = listener.accept() => {
+                    let (tcp, _addr) = match result {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "TLS accept error");
+                            continue;
+                        }
+                    };
+                    let acceptor = acceptor.clone();
+                    let router = router.clone();
+                    let auto_builder = auto_builder.clone();
+                    tokio::spawn(async move {
+                        let tls_stream = match acceptor.accept(tcp).await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::debug!(error = %e, "TLS handshake error");
+                                return;
+                            }
+                        };
+
+                        // Extract CN from client cert (present only for mTLS connections).
+                        let cn = crate::tls::extract_cn_from_tls_stream(&tls_stream);
+
+                        // Wrap the router with a per-connection layer that injects
+                        // `MtlsClientCn` into request extensions.
+                        let svc = if let Some(cn_value) = cn {
+                            let cn_ext = crate::identity::MtlsClientCn(cn_value);
+                            router.layer(axum::middleware::from_fn(
+                                move |mut req: axum::extract::Request,
+                                      next: axum::middleware::Next| {
+                                    let cn_ext = cn_ext.clone();
+                                    async move {
+                                        req.extensions_mut().insert(cn_ext);
+                                        next.run(req).await
+                                    }
+                                },
+                            ))
+                        } else {
+                            // No client cert — pass through unchanged.
+                            router
+                        };
+
+                        let io = TokioIo::new(tls_stream);
+                        // axum::Router implements tower::Service, not hyper::Service
+                        // directly — wrap it with TowerToHyperService.
+                        let hyper_svc =
+                            hyper_util::service::TowerToHyperService::new(svc);
+                        if let Err(e) = auto_builder.serve_connection(io, hyper_svc).await {
+                            tracing::debug!(error = %e, "TLS connection error");
+                        }
+                    });
+                }
+            }
+        }
+    } else {
+        // Plain-TCP path (existing implementation).
+        let listen_addr = listener.local_addr()?;
+        tracing::info!(addr = %listen_addr, "listening");
+
+        axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                // Wait for the caller's shutdown signal (SIGTERM / Ctrl-C / test oneshot).
+                shutdown.await;
+                // Drain: keep existing connections alive until they finish or the
+                // configured timeout expires, then close everything.
+                tracing::info!(
+                    drain_secs = shutdown_timeout.as_secs_f64(),
+                    "graceful shutdown: draining in-flight requests"
+                );
+                tokio::time::sleep(shutdown_timeout).await;
+            })
+            .await?;
+    }
 
     tracing::info!("server shut down cleanly");
     Ok(())
