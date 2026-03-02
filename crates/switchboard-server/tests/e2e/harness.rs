@@ -11,6 +11,27 @@ use switchboard_server::config::routing::RoutingConfig;
 use crate::client::TestClient;
 use crate::config::{BuildOpts, ProviderMocks};
 
+// ── TLS support ───────────────────────────────────────────────────────────────
+
+/// In-memory TLS certificate material for E2E tests.
+///
+/// Generated with `rcgen` so tests need no external cert files.
+#[derive(Clone)]
+pub struct TlsTestConfig {
+    /// PEM-encoded server certificate (signed by the CA so `ca_cert_pem`
+    /// clients can verify it).
+    pub server_cert_pem: String,
+    /// PEM-encoded server private key.
+    pub server_key_pem: String,
+    /// PEM-encoded CA certificate that signed both server and client certs.
+    /// Used by `TestClient` to verify the server certificate.
+    pub ca_cert_pem: String,
+    /// Optional PEM-encoded client certificate for mTLS.
+    pub client_cert_pem: Option<String>,
+    /// Optional PEM-encoded client private key for mTLS.
+    pub client_key_pem: Option<String>,
+}
+
 /// Per-provider wiremock mock servers.
 pub struct HarnessMocks {
     pub openai: Option<MockServer>,
@@ -33,6 +54,9 @@ pub struct TestHarness {
     pub client: TestClient,
     /// Sending half of the shutdown channel. Dropping this stops the server.
     pub _shutdown: tokio::sync::oneshot::Sender<()>,
+    /// Temp files holding TLS cert material. Kept alive until harness drops.
+    #[allow(dead_code)]
+    _tls_temp_files: Vec<tempfile::NamedTempFile>,
 }
 
 /// Builder for [`TestHarness`].
@@ -57,6 +81,9 @@ pub struct TestHarnessBuilder {
     /// Extra API keys for the OpenAI pool `(id, api_key_value)` plus selector.
     /// When set, replaces the single default key.
     pub openai_extra_keys: Option<(Vec<(String, String)>, String)>,
+    /// Optional TLS certificate material. When `Some`, the harness binds on
+    /// HTTPS and `TestClient` is constructed with `new_tls`.
+    pub tls: Option<TlsTestConfig>,
 }
 
 impl Default for TestHarnessBuilder {
@@ -74,6 +101,7 @@ impl Default for TestHarnessBuilder {
             routing: None,
             openai_extra_keys: None,
             config_path: String::new(),
+            tls: None,
         }
     }
 }
@@ -192,6 +220,16 @@ impl TestHarnessBuilder {
         self
     }
 
+    /// Configure TLS (one-way or mutual) for this harness.
+    ///
+    /// When `tls.client_cert_pem` is `None`, only server-auth TLS is enabled.
+    /// When `tls.client_cert_pem` is `Some`, the server requires a client
+    /// certificate (mTLS) and `TestClient` presents one automatically.
+    pub fn with_tls(mut self, tls: TlsTestConfig) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
     /// Build and start the test harness.
     pub async fn build(self) -> TestHarness {
         // Start wiremock servers for each requested provider.
@@ -230,6 +268,68 @@ impl TestHarnessBuilder {
             "127.0.0.1:9090".into()
         };
 
+        // ── TLS: write cert material to temp files ────────────────────────────
+        //
+        // Temp file handles are collected into `tls_temp_files` so they stay
+        // alive until `TestHarness` drops (dropping a `NamedTempFile` deletes
+        // the file, which would break the server).
+        let mut tls_temp_files: Vec<tempfile::NamedTempFile> = Vec::new();
+
+        let (tls_cert_path, tls_key_path, mtls_ca_path, client_identity_pem, tls_ca_pem_bytes) =
+            if let Some(ref tls) = self.tls {
+                use std::io::Write as _;
+
+                // Server certificate.
+                let mut cert_file = tempfile::NamedTempFile::new()
+                    .expect("failed to create temp file for server cert");
+                cert_file
+                    .write_all(tls.server_cert_pem.as_bytes())
+                    .expect("failed to write server cert PEM");
+                let cert_path = cert_file.path().to_str().unwrap().to_string();
+                tls_temp_files.push(cert_file);
+
+                // Server private key.
+                let mut key_file = tempfile::NamedTempFile::new()
+                    .expect("failed to create temp file for server key");
+                key_file
+                    .write_all(tls.server_key_pem.as_bytes())
+                    .expect("failed to write server key PEM");
+                let key_path = key_file.path().to_str().unwrap().to_string();
+                tls_temp_files.push(key_file);
+
+                // CA cert: only written if mTLS (client cert present).
+                let ca_path = if tls.client_cert_pem.is_some() {
+                    let mut ca_file = tempfile::NamedTempFile::new()
+                        .expect("failed to create temp file for CA cert");
+                    ca_file
+                        .write_all(tls.ca_cert_pem.as_bytes())
+                        .expect("failed to write CA cert PEM");
+                    let ca_path = ca_file.path().to_str().unwrap().to_string();
+                    tls_temp_files.push(ca_file);
+                    Some(ca_path)
+                } else {
+                    None
+                };
+
+                // Client identity = cert PEM + key PEM concatenated (reqwest format).
+                let client_identity = tls
+                    .client_cert_pem
+                    .as_ref()
+                    .zip(tls.client_key_pem.as_ref())
+                    .map(|(c, k)| format!("{}{}", c, k));
+
+                let ca_bytes = tls.ca_cert_pem.as_bytes().to_vec();
+                (
+                    Some(cert_path),
+                    Some(key_path),
+                    ca_path,
+                    client_identity,
+                    Some(ca_bytes),
+                )
+            } else {
+                (None, None, None, None, None)
+            };
+
         let mocks = ProviderMocks {
             openai: openai_mock,
             anthropic: anthropic_mock,
@@ -248,13 +348,35 @@ impl TestHarnessBuilder {
                 model_selection: self.model_selection,
                 routing: self.routing,
                 openai_extra_keys: self.openai_extra_keys,
+                tls_cert_path,
+                tls_key_path,
+                mtls_ca_path,
             },
         );
 
-        let (addr, admin_addr, shutdown) =
-            crate::server::start_test_server(config, self.admin_enabled, self.config_path).await;
+        // For mTLS servers the readiness probe also needs to present a client
+        // certificate, otherwise the TLS handshake fails at the server side.
+        let probe_identity_pem: Option<Vec<u8>> = client_identity_pem
+            .as_deref()
+            .map(|s| s.as_bytes().to_vec());
 
-        let client = TestClient::new(addr, admin_addr);
+        let (addr, admin_addr, shutdown) = crate::server::start_test_server(
+            config,
+            self.admin_enabled,
+            self.config_path,
+            tls_ca_pem_bytes,
+            probe_identity_pem,
+        )
+        .await;
+
+        // Build the client: TLS-aware when cert material is present.
+        let client = if let Some(ref tls) = self.tls {
+            let ca_bytes = tls.ca_cert_pem.as_bytes();
+            let identity_pem = client_identity_pem.as_deref().map(str::as_bytes);
+            TestClient::new_tls(addr, admin_addr, ca_bytes, identity_pem)
+        } else {
+            TestClient::new(addr, admin_addr)
+        };
 
         TestHarness {
             addr,
@@ -268,6 +390,7 @@ impl TestHarnessBuilder {
             },
             client,
             _shutdown: shutdown,
+            _tls_temp_files: tls_temp_files,
         }
     }
 }

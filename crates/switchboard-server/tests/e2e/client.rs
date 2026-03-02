@@ -34,6 +34,42 @@ impl TestClient {
         }
     }
 
+    /// Create a new test client for TLS (HTTPS) connections.
+    ///
+    /// `ca_cert_pem` is the PEM-encoded CA certificate that signed the server
+    /// certificate. `client_identity_pem` is an optional byte slice containing
+    /// the concatenated client certificate + private key PEM for mTLS.
+    pub fn new_tls(
+        proxy_addr: SocketAddr,
+        admin_addr: Option<SocketAddr>,
+        ca_cert_pem: &[u8],
+        client_identity_pem: Option<&[u8]>,
+    ) -> Self {
+        let ca_cert =
+            reqwest::Certificate::from_pem(ca_cert_pem).expect("valid CA cert PEM for TestClient");
+        // Force the rustls TLS backend so that reqwest::Identity::from_pem
+        // (which produces a ClientCert::Pem) is handled by the rustls code
+        // path. Without use_rustls_tls(), reqwest may select the default-tls
+        // (native-tls) backend, which rejects PEM identities.
+        let mut builder = reqwest::Client::builder()
+            .use_rustls_tls()
+            .timeout(std::time::Duration::from_secs(10))
+            .add_root_certificate(ca_cert);
+        if let Some(identity_pem) = client_identity_pem {
+            let identity = reqwest::Identity::from_pem(identity_pem)
+                .expect("valid mTLS identity PEM for TestClient");
+            builder = builder.identity(identity);
+        }
+        Self {
+            inner: builder.build().expect("failed to build TLS reqwest client"),
+            base_url: format!("https://{}", proxy_addr),
+            // The admin server is always plain HTTP (no TLS on the admin
+            // listener), so admin URLs use http:// even in TLS test setups.
+            admin_url: admin_addr.map(|a| format!("http://{}", a)),
+            api_key: "test-api-key".into(),
+        }
+    }
+
     // ── Proxy endpoints ────────────────────────────────────────────────────────
 
     /// `POST /v1/chat/completions` with the test API key.

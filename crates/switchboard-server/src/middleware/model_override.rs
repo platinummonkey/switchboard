@@ -18,15 +18,18 @@
 //! Priority order:
 //! 1. `x-switchboard-model` header — explicit client override (no body parse).
 //! 2. `selector.select(&ctx)` where `ctx.model` comes from the JSON body and
-//!    `ctx.user_id` is resolved from two sources (first wins):
+//!    `ctx.user_id` is resolved from three sources (first wins):
 //!    - `x-switchboard-user` header — explicit client identity override.
 //!    - [`crate::auth::validator::ValidatedClient`]`.user_id` from extensions,
 //!      set by [`super::auth_layer::AuthLayer`] when a static API key is
 //!      mapped via `identity.api_key_mappings`.  Because `AuthLayer` runs
 //!      before `ModelOverrideLayer`, this extension is always available.
+//!    - [`crate::identity::MtlsClientCn`] extension — set by the TLS accept
+//!      loop when a client certificate is present. Allows per-user model
+//!      overrides keyed on the mTLS Common Name.
 //!
-//!    This dual-source identity enables `mapping` mode and per-user `dynamic`
-//!    overrides for api-key-authenticated users.
+//!    This triple-source identity enables `mapping` mode and per-user `dynamic`
+//!    overrides for api-key-authenticated and mTLS-authenticated users.
 //!
 //! # Extensions set
 //!
@@ -54,6 +57,7 @@ use switchboard_common::types::RequestContext;
 
 use crate::auth::validator::ValidatedClient;
 use crate::config::provider::ProvidersConfig;
+use crate::identity::MtlsClientCn;
 use crate::providers::ProviderRegistry;
 use crate::routing::{ModelSelector, SelectionReason};
 
@@ -215,11 +219,14 @@ where
                 //      `identity.api_key_mappings` in the server config.
                 //      AuthLayer runs before ModelOverrideLayer, so the
                 //      extension is already populated at this point.
+                //   3. `MtlsClientCn` extension — set by the TLS accept loop
+                //      when a client certificate is present. Enables per-user
+                //      model overrides keyed on the mTLS Common Name.
                 //
-                // This fallback enables per-user model overrides in `dynamic`
-                // mode to fire for api-key-authenticated users without
-                // requiring them to send an explicit `x-switchboard-user`
-                // header.
+                // This triple-source identity enables `mapping` mode and
+                // per-user `dynamic` overrides for api-key-authenticated users
+                // and mTLS-authenticated users without requiring an explicit
+                // `x-switchboard-user` header.
                 let user_id: Option<String> = parts
                     .headers
                     .get(HEADER_USER)
@@ -231,6 +238,12 @@ where
                             .extensions
                             .get::<ValidatedClient>()
                             .and_then(|c| c.user_id.clone())
+                    })
+                    .or_else(|| {
+                        parts
+                            .extensions
+                            .get::<MtlsClientCn>()
+                            .map(|cn| cn.0.clone())
                     });
 
                 // Build a RequestContext enriched with what we know at this

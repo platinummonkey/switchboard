@@ -13,7 +13,9 @@ use switchboard_server::config::model_selection::ModelSelectionConfig;
 use switchboard_server::config::provider::{KeyEntry, KeyPoolConfig, ProviderConfig};
 use switchboard_server::config::rate_limit::RateLimitConfig;
 use switchboard_server::config::routing::RoutingConfig;
-use switchboard_server::config::{AuthConfig, ServerConfig, ValidatorConfig};
+use switchboard_server::config::{
+    AuthConfig, IdentityConfig, ServerConfig, ServerListenConfig, ValidatorConfig,
+};
 
 /// Handles to all optional per-provider wiremock mock servers.
 pub struct ProviderMocks {
@@ -42,6 +44,14 @@ pub struct BuildOpts {
     /// Multi-key OpenAI pool `([(id, api_key)], selector)`.
     /// When `Some`, replaces the default single-key OpenAI pool entry.
     pub openai_extra_keys: Option<(Vec<(String, String)>, String)>,
+    /// Path to PEM-encoded TLS server certificate.
+    /// When set together with `tls_key_path`, the proxy listens on HTTPS.
+    pub tls_cert_path: Option<String>,
+    /// Path to PEM-encoded TLS server private key.
+    pub tls_key_path: Option<String>,
+    /// Path to PEM-encoded CA certificate for verifying mTLS client certificates.
+    /// When set, mutual TLS is required.
+    pub mtls_ca_path: Option<String>,
 }
 
 impl Default for BuildOpts {
@@ -54,6 +64,9 @@ impl Default for BuildOpts {
             model_selection: None,
             routing: None,
             openai_extra_keys: None,
+            tls_cert_path: None,
+            tls_key_path: None,
+            mtls_ca_path: None,
         }
     }
 }
@@ -289,7 +302,33 @@ pub fn build_test_config(mocks: &ProviderMocks, opts: &BuildOpts) -> ServerConfi
     let model_selection = opts.model_selection.clone().unwrap_or_default();
     let routing = opts.routing.clone().unwrap_or_default();
 
+    // Build the server listen config, wiring in TLS paths when provided.
+    let server = ServerListenConfig {
+        tls_cert_path: opts.tls_cert_path.clone(),
+        tls_key_path: opts.tls_key_path.clone(),
+        mtls_ca_path: opts.mtls_ca_path.clone(),
+        ..ServerListenConfig::default()
+    };
+
+    // When mTLS is configured, prepend "mtls_cn" to the identity resolver
+    // chain so the client certificate Common Name is available as user_id.
+    // This enables per-user model overrides keyed on the CN.
+    let identity = if opts.mtls_ca_path.is_some() {
+        IdentityConfig {
+            resolvers: {
+                let mut resolvers = vec!["mtls_cn".to_string()];
+                resolvers.extend(IdentityConfig::default().resolvers);
+                resolvers
+            },
+            ..IdentityConfig::default()
+        }
+    } else {
+        IdentityConfig::default()
+    };
+
     ServerConfig {
+        server,
+        identity,
         providers,
         auth: AuthConfig { validators },
         admin,
