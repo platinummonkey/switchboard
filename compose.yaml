@@ -1,0 +1,73 @@
+# Podman Compose / Docker Compose for local Switchboard development.
+#
+# Usage:
+#   cp .env.example .env          # fill in your API keys
+#   podman compose up --build     # build images and start both services
+#
+# Tool access (once running):
+#   Claude Code : ANTHROPIC_BASE_URL=http://localhost:8877/api
+#   OpenAI compat: base URL http://localhost:8877/v1
+#   Admin API   : http://localhost:9090/admin/api/v1/
+#
+# Env vars required (see .env.example):
+#   SWITCHBOARD_API_KEY      shared secret between local and server
+#   SWITCHBOARD_ADMIN_TOKEN  bearer token for the admin API
+#   ANTHROPIC_API_KEY        upstream Anthropic key
+#   OPENAI_API_KEY           upstream OpenAI key
+
+name: switchboard
+
+services:
+
+  # ── switchboard-server ──────────────────────────────────────────────────────
+  switchboard-server:
+    build:
+      context: .
+      dockerfile: Containerfile
+      target: server
+    image: switchboard-server:dev
+    restart: unless-stopped
+    environment:
+      SWITCHBOARD_CONFIG: /etc/switchboard/server.toml
+      SWITCHBOARD_API_KEY: ${SWITCHBOARD_API_KEY}
+      SWITCHBOARD_ADMIN_TOKEN: ${SWITCHBOARD_ADMIN_TOKEN}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./deploy/server.toml:/etc/switchboard/server.toml:ro
+    ports:
+      - "8080:8080"   # proxy (direct access, bypass local)
+      - "9090:9090"   # admin API + UI
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf -H 'Authorization: Bearer ${SWITCHBOARD_API_KEY}' http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  # ── switchboard-local ───────────────────────────────────────────────────────
+  switchboard-local:
+    build:
+      context: .
+      dockerfile: Containerfile
+      target: local
+    image: switchboard-local:dev
+    restart: unless-stopped
+    depends_on:
+      switchboard-server:
+        condition: service_healthy
+    environment:
+      SWITCHBOARD_API_KEY: ${SWITCHBOARD_API_KEY}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      # Mounted as a template so the entrypoint can substitute env vars before start.
+      - ./deploy/local.toml:/home/switchboard/.switchboard/config.toml.tmpl:ro
+    ports:
+      - "8877:8877"   # OpenAI/Anthropic-compat endpoint for local tools
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8877/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s

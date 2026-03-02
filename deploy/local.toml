@@ -1,0 +1,29 @@
+# switchboard-local config for local compose/podman environment.
+#
+# Env vars (set in .env or shell before running compose):
+#   SWITCHBOARD_API_KEY  - must match the key in deploy/server.toml
+
+[server]
+# "switchboard-server" resolves via the compose network.
+url = "http://switchboard-server:8080"
+
+[auth]
+method = "api_key"
+api_key = "${SWITCHBOARD_API_KEY}"
+
+[identity]
+# Override with your own username so spans are attributed correctly.
+user = "dev"
+team = "local"
+
+[local]
+# Bind to all interfaces so the port is reachable from the host.
+listen = "0.0.0.0:8877"
+
+[model]
+default = "claude-sonnet-4-20250514"
+
+[model.overrides]
+"gpt-4"        = "claude-sonnet-4-20250514"
+"gpt-4o"       = "claude-sonnet-4-20250514"
+"gpt-3.5-turbo" = "claude-haiku-4-5-20251001"

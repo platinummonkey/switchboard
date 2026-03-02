@@ -1,0 +1,108 @@
+# switchboard-server config for local compose/podman environment.
+#
+# Env vars (set in .env or shell before running compose):
+#   SWITCHBOARD_API_KEY      - shared API key accepted from switchboard-local
+#   SWITCHBOARD_ADMIN_TOKEN  - bearer token for the admin API
+#   ANTHROPIC_API_KEY        - Anthropic API key (optional)
+#   OPENAI_API_KEY           - OpenAI API key (optional)
+
+[server]
+listen = "0.0.0.0:8080"
+graceful_shutdown_timeout = "10s"
+
+[admin]
+enabled = true
+# Bind to all interfaces so the admin API is reachable from the host.
+listen = "0.0.0.0:9090"
+auth = "static_token"
+static_token = "${SWITCHBOARD_ADMIN_TOKEN}"
+
+[identity]
+resolvers = ["header", "api_key"]
+header_name = "x-switchboard-user"
+
+# Static API key accepted from switchboard-local (and any other client).
+[auth.validators.local]
+type = "static_keys"
+keys = ["${SWITCHBOARD_API_KEY}"]
+
+# ── Providers ─────────────────────────────────────────────────────────────────
+# Uncomment and populate the providers you want to use.
+# At least one provider must be configured for proxy requests to succeed.
+
+[providers.anthropic]
+base_url = "https://api.anthropic.com"
+api_format = "anthropic"
+models = [
+    "claude-sonnet-4-20250514",
+    "claude-opus-4-20250514",
+    "claude-haiku-4-5-20251001",
+]
+timeout = "300s"
+health_check_interval = "60s"
+max_concurrent = 50
+
+[providers.anthropic.key_pool]
+selector = "weighted_random"
+
+[[providers.anthropic.key_pool.keys]]
+id = "anthropic-1"
+type = "static"
+api_key = "${ANTHROPIC_API_KEY}"
+weight = 1.0
+
+[providers.openai]
+base_url = "https://api.openai.com"
+api_format = "openai"
+models = ["gpt-4o", "gpt-4o-mini", "o3-mini"]
+timeout = "120s"
+health_check_interval = "60s"
+max_concurrent = 50
+
+[providers.openai.key_pool]
+selector = "weighted_random"
+
+[[providers.openai.key_pool.keys]]
+id = "openai-1"
+type = "static"
+api_key = "${OPENAI_API_KEY}"
+weight = 1.0
+
+# ── Model selection ───────────────────────────────────────────────────────────
+
+[model_selection]
+mode = "dynamic"
+header = "x-switchboard-model"
+fallback = "claude-sonnet-4-20250514"
+
+[model_selection.mappings]
+"gpt-4"        = "claude-sonnet-4-20250514"
+"gpt-4o"       = "claude-sonnet-4-20250514"
+"gpt-3.5-turbo" = "claude-haiku-4-5-20251001"
+
+# ── Guardrails ────────────────────────────────────────────────────────────────
+
+[guardrails]
+enabled = false
+fail_mode = "open"
+timeout = "500ms"
+streaming_mode = "async_audit"
+
+# ── Observability ─────────────────────────────────────────────────────────────
+
+[observability]
+enabled = false
+exporter = "otlp"
+otlp_endpoint = "http://localhost:4317"
+service_name = "switchboard"
+environment = "local"
+sample_rate = 1.0
+capture_prompts = false
+batch_flush_interval = "5s"
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+
+[rate_limit]
+enabled = false
+default_rpm = 60
+default_tpm = 100000
