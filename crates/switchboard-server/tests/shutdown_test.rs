@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
-use switchboard_server::config::{AuthConfig, ServerConfig, ValidatorConfig};
+use switchboard_server::config::{AuthConfig, ServerConfig, ServerListenConfig, ValidatorConfig};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -29,6 +29,10 @@ fn minimal_config() -> ServerConfig {
     );
     ServerConfig {
         auth: AuthConfig { validators },
+        server: ServerListenConfig {
+            graceful_shutdown_timeout: "0s".to_string(),
+            ..Default::default()
+        },
         ..ServerConfig::default()
     }
 }

@@ -532,8 +532,10 @@ async fn test_local_returns_error_when_server_shuts_down() {
         .mount(&upstream)
         .await;
 
-    // 2. Start switchboard-server.
-    let server_config = build_server_config(&upstream.uri());
+    // 2. Start switchboard-server with a zero drain timeout so it stops
+    //    accepting requests immediately upon receiving the shutdown signal.
+    let mut server_config = build_server_config(&upstream.uri());
+    server_config.server.graceful_shutdown_timeout = "0s".to_string();
     let (server_addr, server_shutdown_tx) = start_server(server_config).await;
     let server_url = format!("http://{server_addr}");
 
