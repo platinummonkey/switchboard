@@ -33,6 +33,61 @@ pub use provider::ProvidersConfig;
 pub use rate_limit::RateLimitConfig;
 pub use routing::RoutingConfig;
 
+// ── Database ───────────────────────────────────────────────────────────────────
+
+fn default_max_connections() -> u32 {
+    10
+}
+
+fn default_connection_timeout() -> String {
+    "5s".into()
+}
+
+/// Postgres persistence layer configuration.
+///
+/// All fields are optional/defaulted so that omitting the `[database]` section
+/// from the TOML config is equivalent to `enabled = false`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    /// Enable the Postgres persistence layer. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Connection URL for the write (primary) database.
+    #[serde(default)]
+    pub write_url: String,
+
+    /// Optional read-replica URLs (round-robin). Falls back to `write_url`
+    /// when empty.
+    #[serde(default)]
+    pub read_urls: Vec<String>,
+
+    /// Maximum connections per pool.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
+
+    /// Run pending migrations on startup when `true`.
+    #[serde(default)]
+    pub auto_migrate: bool,
+
+    /// Timeout for establishing a new connection.
+    #[serde(default = "default_connection_timeout")]
+    pub connection_timeout: String,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            write_url: String::new(),
+            read_urls: Vec::new(),
+            max_connections: default_max_connections(),
+            auto_migrate: false,
+            connection_timeout: default_connection_timeout(),
+        }
+    }
+}
+
 use crate::error::ServerError;
 
 // ── Identity ──────────────────────────────────────────────────────────────────
@@ -206,6 +261,9 @@ pub struct ServerConfig {
 
     #[serde(default)]
     pub rate_limit: RateLimitConfig,
+
+    #[serde(default)]
+    pub database: DatabaseConfig,
 }
 
 // ── Loading ───────────────────────────────────────────────────────────────────

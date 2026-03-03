@@ -38,6 +38,7 @@ fn make_admin_state() -> Arc<AdminState> {
         auth_state,
         Arc::new(switchboard_server::observability::UsageTracker::new()),
         handle,
+        None,
     ))
 }
 

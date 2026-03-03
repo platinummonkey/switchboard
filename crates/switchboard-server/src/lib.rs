@@ -6,6 +6,7 @@
 pub mod admin;
 pub mod auth;
 pub mod config;
+pub mod db;
 pub mod error;
 pub mod guardrails;
 pub mod identity;
@@ -20,6 +21,8 @@ pub mod tls;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+
+use crate::db::DbPool;
 
 use anyhow::Result;
 use axum::Router;
@@ -408,6 +411,132 @@ pub async fn build_providers(
     (registry, pools)
 }
 
+/// Apply DB-persisted overrides onto `config` before the server starts.
+///
+/// - Rate limit overrides from `rate_limit_overrides` are merged into
+///   `config.rate_limit.overrides`.
+/// - Config snapshots for `model_selection`, `guardrails`, and `routing` from
+///   `config_overrides` replace the corresponding config sections.
+/// - Key pool entries from `key_pool_entries` update weights on existing keys
+///   and reconstruct non-static (aws_sts/vault) keys that are new.  Static
+///   keys that only exist in the DB (not TOML) are skipped with a warning.
+async fn apply_db_overrides(
+    pool: &DbPool,
+    config: &mut crate::config::ServerConfig,
+) -> Result<(), crate::error::ServerError> {
+    use crate::config::rate_limit::RateLimitOverride;
+    use crate::db::queries;
+
+    // ── Rate limit overrides ────────────────────────────────────────────────
+    let rl_rows = queries::list_rate_limit_overrides(pool.read()).await?;
+    for row in rl_rows {
+        config.rate_limit.overrides.insert(
+            row.id.clone(),
+            RateLimitOverride {
+                rpm: Some(row.rpm as u32),
+                tpm: Some(row.tpm as u32),
+            },
+        );
+        tracing::debug!(id = %row.id, "loaded rate limit override from DB");
+    }
+
+    // ── Config section overrides ────────────────────────────────────────────
+    for section in ["model_selection", "guardrails", "routing"] {
+        let Some(row) = queries::get_config_override(pool.read(), section).await? else {
+            continue;
+        };
+        match section {
+            "model_selection" => match serde_json::from_value(row.config_json) {
+                Ok(ms) => {
+                    config.model_selection = ms;
+                    tracing::info!("applied model_selection override from DB");
+                }
+                Err(e) => {
+                    tracing::warn!(section, error = %e, "failed to deserialize config override, skipping");
+                }
+            },
+            "guardrails" => match serde_json::from_value(row.config_json) {
+                Ok(g) => {
+                    config.guardrails = g;
+                    tracing::info!("applied guardrails override from DB");
+                }
+                Err(e) => {
+                    tracing::warn!(section, error = %e, "failed to deserialize config override, skipping");
+                }
+            },
+            "routing" => match serde_json::from_value(row.config_json) {
+                Ok(r) => {
+                    config.routing = r;
+                    tracing::info!("applied routing override from DB");
+                }
+                Err(e) => {
+                    tracing::warn!(section, error = %e, "failed to deserialize config override, skipping");
+                }
+            },
+            _ => {}
+        }
+    }
+
+    // ── Key pool entries ────────────────────────────────────────────────────
+    let key_rows = queries::list_key_pool_entries(pool.read()).await?;
+    for row in key_rows {
+        let Some(provider_cfg) = config.providers.get_mut(&row.provider_id) else {
+            tracing::warn!(
+                provider_id = %row.provider_id,
+                key_id = %row.id,
+                "key pool entry references unknown provider, skipping"
+            );
+            continue;
+        };
+
+        if let Some(entry) = provider_cfg.key_pool.keys.iter_mut().find(|k| k.id == row.id) {
+            // Update weight on an existing TOML key.
+            entry.weight = row.weight;
+            tracing::debug!(key_id = %row.id, weight = row.weight, "updated key weight from DB");
+        } else if row.key_type != "static" {
+            // Reconstruct non-static keys from source_config.
+            let entry = crate::config::provider::KeyEntry {
+                id: row.id.clone(),
+                key_type: row.key_type.clone(),
+                api_key: None,
+                role_arn: row
+                    .source_config
+                    .get("role_arn")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                region: row
+                    .source_config
+                    .get("region")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                refresh_interval: None,
+                vault_path: row
+                    .source_config
+                    .get("vault_path")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned),
+                weight: row.weight,
+            };
+            provider_cfg.key_pool.keys.push(entry);
+            tracing::info!(
+                provider_id = %row.provider_id,
+                key_id = %row.id,
+                key_type = %row.key_type,
+                "reconstructed dynamic key from DB"
+            );
+        } else {
+            // Static key in DB but not TOML — skip (credential not stored in DB).
+            tracing::warn!(
+                provider_id = %row.provider_id,
+                key_id = %row.id,
+                "static key found in DB but not in TOML config, skipping"
+            );
+        }
+    }
+
+    Ok(())
+}
+
 /// Start the full switchboard server.
 ///
 /// Accepts a pre-bound [`tokio::net::TcpListener`] for the proxy and an
@@ -427,7 +556,7 @@ pub async fn build_providers(
 /// - `shutdown` — Future that resolves when the server should begin graceful
 ///   shutdown.
 pub async fn run_server(
-    config: crate::config::ServerConfig,
+    mut config: crate::config::ServerConfig,
     config_path: &str,
     listener: tokio::net::TcpListener,
     admin_listener: Option<tokio::net::TcpListener>,
@@ -440,6 +569,24 @@ pub async fn run_server(
     // Clone the listen config before config is moved into Arc<AppState>.
     // Needed to call build_tls_acceptor after AppState is constructed.
     let server_listen_config = config.server.clone();
+
+    // ── DB init (optional) ─────────────────────────────────────────────────
+    // Connect, migrate, and overlay DB-persisted overrides onto the in-memory
+    // config before building the rest of the server state.  When
+    // `database.enabled = false` this is a no-op and all existing tests pass
+    // without any Postgres instance.
+    let db_pool: Option<Arc<DbPool>> = if config.database.enabled {
+        tracing::info!("database enabled, connecting...");
+        let pool = DbPool::connect(&config.database).await?;
+        if config.database.auto_migrate {
+            pool.migrate().await?;
+        }
+        apply_db_overrides(&pool, &mut config).await?;
+        tracing::info!("database overrides applied");
+        Some(Arc::new(pool))
+    } else {
+        None
+    };
 
     // Extract sub-configs needed for middleware before server_config is
     // moved into AppState.
@@ -528,6 +675,7 @@ pub async fn run_server(
             admin_auth_state,
             Arc::clone(&usage),
             rate_limit_handle.clone(),
+            db_pool.clone(),
         ));
 
         let admin_listen = app_state.config.admin.listen.clone();

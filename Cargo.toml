@@ -94,6 +94,9 @@ rand = "0.8"
 subtle = "2"
 libc = "0.2"
 
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "json", "chrono", "migrate"] }
+
 # Testing
 wiremock = "0.6"
 insta = { version = "1", features = ["json", "yaml"] }

@@ -106,3 +106,15 @@ batch_flush_interval = "5s"
 enabled = false
 default_rpm = 60
 default_tpm = 100000
+
+# ── Database (optional Postgres persistence) ──────────────────────────────────
+# Uncomment and populate to enable persistence of admin mutations across
+# restarts and across multiple server replicas.
+#
+# [database]
+# enabled = false
+# write_url = "postgresql://switchboard:changeme@localhost:5432/switchboard"
+# read_urls = []
+# max_connections = 10
+# auto_migrate = false
+# connection_timeout = "5s"

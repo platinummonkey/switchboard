@@ -17,6 +17,8 @@ use crate::admin::auth::AdminAuth;
 use crate::config::provider::KeyEntry;
 use crate::config::rate_limit::RateLimitOverride;
 use crate::config::{GuardrailsConfig, ModelSelectionConfig, RateLimitConfig, RoutingConfig};
+use crate::db::DbPool;
+use crate::db::queries;
 use crate::middleware::RateLimitSettings;
 
 // ── Provider / Key Pool response types ───────────────────────────────────────
@@ -54,10 +56,40 @@ pub struct KeyHealthResponse {
     pub last_error: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct UpdateKeyRequest {
     pub weight: Option<f64>,
     pub status: Option<String>,
+}
+
+// ── DB write helper ───────────────────────────────────────────────────────────
+
+/// Run a DB write closure and return a 500 response if it fails.
+///
+/// Returns `None` when `db` is `None` (persistence disabled) or when the write
+/// succeeds — the caller continues with the in-memory update.  Returns
+/// `Some(error_response)` when the write fails — the caller should return it
+/// immediately so that in-memory state is only updated after a successful DB
+/// write.
+async fn db_write_or_err<F, Fut>(
+    db: Option<Arc<DbPool>>,
+    f: F,
+) -> Option<(StatusCode, Json<serde_json::Value>)>
+where
+    F: FnOnce(Arc<DbPool>) -> Fut + Send,
+    Fut: std::future::Future<Output = Result<(), crate::error::ServerError>> + Send,
+{
+    let db = db?;
+    match f(db).await {
+        Ok(()) => None,
+        Err(e) => {
+            tracing::error!(error = %e, "database write failed");
+            Some((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "database write failed"})),
+            ))
+        }
+    }
 }
 
 // ── Provider/Key handlers ─────────────────────────────────────────────────────
@@ -142,6 +174,30 @@ pub async fn add_provider_key(
     Path(provider_id): Path<String>,
     Json(entry): Json<KeyEntry>,
 ) -> impl IntoResponse {
+    // Write to DB first (if enabled). Only update in-memory state on success.
+    let source_config = match entry.key_type.as_str() {
+        "aws_sts" => serde_json::json!({
+            "role_arn": entry.role_arn,
+            "region": entry.region,
+        }),
+        "vault" => serde_json::json!({
+            "vault_path": entry.vault_path,
+        }),
+        _ => serde_json::json!({}),
+    };
+    let pid = provider_id.clone();
+    let eid = entry.id.clone();
+    let etype = entry.key_type.clone();
+    let eweight = entry.weight;
+    let sc = source_config.clone();
+    if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
+        queries::upsert_key_pool_entry(db.write(), &pid, &eid, &etype, eweight, "healthy", &sc).await
+    })
+    .await
+    {
+        return err;
+    }
+
     // Update the in-memory hot config to persist across config reads.
     state.hot_config.update(|cfg| {
         if let Some(provider_cfg) = cfg.providers.get_mut(&provider_id) {
@@ -227,6 +283,17 @@ pub async fn delete_provider_key(
         );
     };
 
+    // Write to DB first (if enabled).
+    let pid = provider_id.clone();
+    let kid = key_id.clone();
+    if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
+        queries::delete_key_pool_entry(db.write(), &pid, &kid).await
+    })
+    .await
+    {
+        return err;
+    }
+
     // Remove from config.
     state.hot_config.update(|cfg| {
         if let Some(provider_cfg) = cfg.providers.get_mut(&provider_id) {
@@ -281,14 +348,37 @@ pub async fn update_provider_key(
             }
         };
     }
-    let pool_guard = pool.read().unwrap();
-    let Some(key_arc) = pool_guard.get_key(&key_id) else {
+    // Block-scope the RwLockReadGuard so it's dropped before the .await below.
+    // RwLockReadGuard is !Send and must not be held across an await point.
+    let key_arc = {
+        let pool_guard = pool.read().unwrap();
+        pool_guard.get_key(&key_id)
+    };
+    let Some(key_arc) = key_arc else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "key not found"})),
         );
     };
-    drop(pool_guard);
+
+    // Write weight/status changes to DB first (if enabled).
+    let pid = provider_id.clone();
+    let kid = key_id.clone();
+    let update2 = update.clone();
+    if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
+        if let Some(w) = update2.weight {
+            queries::update_key_weight(db.write(), &pid, &kid, w).await?;
+        }
+        if let Some(ref s) = update2.status {
+            queries::update_key_status(db.write(), &pid, &kid, s).await?;
+        }
+        Ok(())
+    })
+    .await
+    {
+        return err;
+    }
+
     {
         let mut key = key_arc.write().unwrap();
         if let Some(weight) = update.weight {
@@ -386,6 +476,22 @@ pub async fn put_model_selection(
     _auth: AdminAuth,
     Json(new_config): Json<ModelSelectionConfig>,
 ) -> impl IntoResponse {
+    let json = match serde_json::to_value(&new_config) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            );
+        }
+    };
+    if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
+        queries::upsert_config_override(db.write(), "model_selection", &json).await
+    })
+    .await
+    {
+        return err;
+    }
     state.hot_config.update(|cfg| {
         cfg.model_selection = new_config.clone();
     });
@@ -427,6 +533,22 @@ pub async fn put_guardrails(
     _auth: AdminAuth,
     Json(new_config): Json<GuardrailsConfig>,
 ) -> impl IntoResponse {
+    let json = match serde_json::to_value(&new_config) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            );
+        }
+    };
+    if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
+        queries::upsert_config_override(db.write(), "guardrails", &json).await
+    })
+    .await
+    {
+        return err;
+    }
     state.hot_config.update(|cfg| {
         cfg.guardrails = new_config.clone();
     });
@@ -547,6 +669,22 @@ pub async fn put_semantic_routing(
     _auth: AdminAuth,
     Json(new_config): Json<RoutingConfig>,
 ) -> impl IntoResponse {
+    let json = match serde_json::to_value(&new_config) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            );
+        }
+    };
+    if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
+        queries::upsert_config_override(db.write(), "routing", &json).await
+    })
+    .await
+    {
+        return err;
+    }
     state.hot_config.update(|cfg| {
         cfg.routing = new_config.clone();
     });
@@ -617,9 +755,24 @@ pub async fn set_rate_limit_override(
     Path(id): Path<String>,
     Json(settings): Json<RateLimitSettings>,
 ) -> impl IntoResponse {
-    // 1. Update the live handle immediately.
+    // 1. Write to DB first (if enabled).
+    let db_id = id.clone();
+    if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
+        queries::upsert_rate_limit_override(
+            db.write(),
+            &db_id,
+            settings.rpm as i32,
+            settings.tpm as i32,
+        )
+        .await
+    })
+    .await
+    {
+        return err;
+    }
+    // 2. Update the live handle immediately.
     state.rate_limit_handle.set_override(id.clone(), settings);
-    // 2. Persist to HotConfig so it survives config reload.
+    // 3. Persist to HotConfig so it survives config reload.
     state.hot_config.update(|cfg| {
         cfg.rate_limit.overrides.insert(
             id.clone(),
@@ -644,6 +797,16 @@ pub async fn delete_rate_limit_override(
     _auth: AdminAuth,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    // 1. Write to DB first (if enabled).
+    let db_id = id.clone();
+    if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
+        queries::delete_rate_limit_override(db.write(), &db_id).await
+    })
+    .await
+    {
+        return err;
+    }
+    // 2. Remove from live handle and HotConfig.
     state.rate_limit_handle.remove_override(&id);
     state.hot_config.update(|cfg| {
         cfg.rate_limit.overrides.remove(&id);
@@ -959,6 +1122,7 @@ mod tests {
             auth_state,
             Arc::new(crate::observability::UsageTracker::new()),
             handle,
+            None,
         ))
     }
 

@@ -67,5 +67,13 @@ expression: "&cfg"
     "default_rpm": 60,
     "default_tpm": 100000,
     "overrides": {}
+  },
+  "database": {
+    "enabled": false,
+    "write_url": "",
+    "read_urls": [],
+    "max_connections": 10,
+    "auto_migrate": false,
+    "connection_timeout": "5s"
   }
 }

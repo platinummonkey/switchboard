@@ -8,6 +8,9 @@ pub enum ServerError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("database error: {0}")]
+    Database(String),
+
     /// Wraps both `tonic::transport::Error` and `tonic::Status` (both are
     /// large types; boxing keeps the enum variant size small so that
     /// `clippy::result_large_err` does not fire).

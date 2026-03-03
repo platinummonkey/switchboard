@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::config::HotConfig;
+use crate::db::DbPool;
 use crate::error::ServerError;
 use crate::key_pool::KeyPool;
 use crate::middleware::RateLimitHandle;
@@ -44,6 +45,9 @@ pub struct AdminState {
     /// Handle to the live rate-limit override table.  Updates here take effect
     /// immediately without restarting the server.
     pub rate_limit_handle: RateLimitHandle,
+
+    /// Optional Postgres connection pool.  `None` when `database.enabled = false`.
+    pub db_pool: Option<Arc<DbPool>>,
 }
 
 impl AdminState {
@@ -54,6 +58,7 @@ impl AdminState {
         auth_state: Arc<AdminAuthState>,
         usage: Arc<UsageTracker>,
         rate_limit_handle: RateLimitHandle,
+        db_pool: Option<Arc<DbPool>>,
     ) -> Self {
         Self {
             hot_config,
@@ -61,6 +66,7 @@ impl AdminState {
             auth_state,
             usage,
             rate_limit_handle,
+            db_pool,
         }
     }
 }
@@ -164,6 +170,7 @@ mod tests {
             auth_state,
             Arc::new(crate::observability::UsageTracker::new()),
             handle,
+            None,
         ))
     }
 
@@ -300,6 +307,7 @@ mod tests {
             auth_state,
             Arc::new(crate::observability::UsageTracker::new()),
             handle,
+            None,
         ));
         let app = build_router(state);
 
@@ -466,6 +474,7 @@ mod tests {
             auth_state,
             Arc::new(crate::observability::UsageTracker::new()),
             handle,
+            None,
         ));
         let app = build_router(state);
 
