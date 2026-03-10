@@ -68,7 +68,7 @@ rcgen = "0.13"
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 
 # Auth / JWT
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 
 # Error handling
 thiserror = "2"
