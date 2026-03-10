@@ -71,7 +71,7 @@ async fn test_e2e_unknown_model_returns_error() {
 
     let status = resp.status().as_u16();
     assert!(
-        status >= 400 && status < 600,
+        (400..600).contains(&status),
         "expected a client/server error for an unknown model, got {}",
         status
     );

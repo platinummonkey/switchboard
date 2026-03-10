@@ -5,6 +5,8 @@
 //!
 //! Run with:  cargo bench -p switchboard-server
 
+use std::sync::Arc;
+
 use criterion::{Criterion, criterion_group, criterion_main};
 
 use switchboard_common::types::{Message, MessageContent, ProxiedResponse, Role, Usage};
@@ -167,17 +169,19 @@ fn bench_key_pool_select(c: &mut Criterion) {
     use switchboard_server::key_pool::provider::{KeySource, PooledKey};
     use switchboard_server::key_pool::selector::WeightedRandomSelector;
 
-    let keys: Vec<PooledKey> = (0..10)
-        .map(|i| PooledKey {
-            id: format!("key-{i}"),
-            credentials: UpstreamCredentials {
-                header_name: HeaderName::from_static("authorization"),
-                header_value: HeaderValue::from_static("Bearer sk-bench"),
-                expires_at: None,
-            },
-            weight: 1.0,
-            source: KeySource::Static,
-            health: KeyHealth::default(),
+    let keys: Vec<Arc<std::sync::RwLock<PooledKey>>> = (0..10)
+        .map(|i| {
+            Arc::new(std::sync::RwLock::new(PooledKey {
+                id: format!("key-{i}"),
+                credentials: UpstreamCredentials {
+                    header_name: HeaderName::from_static("authorization"),
+                    header_value: HeaderValue::from_static("Bearer sk-bench"),
+                    expires_at: None,
+                },
+                weight: 1.0,
+                source: KeySource::Static,
+                health: KeyHealth::default(),
+            }))
         })
         .collect();
 

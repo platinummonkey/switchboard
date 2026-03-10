@@ -198,7 +198,7 @@ mod tests {
         let subject_alt_names = vec!["localhost".into()];
         let cert = generate_simple_self_signed(subject_alt_names).unwrap();
         let cert_pem = cert.cert.pem();
-        let key_pem = cert.key_pair.serialize_pem();
+        let key_pem = cert.signing_key.serialize_pem();
 
         let mut cert_file = tempfile::NamedTempFile::new().unwrap();
         cert_file.write_all(cert_pem.as_bytes()).unwrap();
@@ -233,7 +233,7 @@ mod tests {
         // Server cert.
         let server_cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let server_cert_pem = server_cert.cert.pem();
-        let server_key_pem = server_cert.key_pair.serialize_pem();
+        let server_key_pem = server_cert.signing_key.serialize_pem();
 
         // CA cert (reuse another self-signed for simplicity — in real mTLS this
         // would be a proper CA).
@@ -277,7 +277,7 @@ mod tests {
 
         let mut key_file = tempfile::NamedTempFile::new().unwrap();
         key_file
-            .write_all(cert.key_pair.serialize_pem().as_bytes())
+            .write_all(cert.signing_key.serialize_pem().as_bytes())
             .unwrap();
 
         let config = ServerListenConfig {

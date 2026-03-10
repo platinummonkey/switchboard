@@ -60,6 +60,7 @@ pub struct TestHarness {
 }
 
 /// Builder for [`TestHarness`].
+#[derive(Default)]
 pub struct TestHarnessBuilder {
     pub enable_openai: bool,
     pub enable_anthropic: bool,
@@ -84,26 +85,6 @@ pub struct TestHarnessBuilder {
     /// Optional TLS certificate material. When `Some`, the harness binds on
     /// HTTPS and `TestClient` is constructed with `new_tls`.
     pub tls: Option<TlsTestConfig>,
-}
-
-impl Default for TestHarnessBuilder {
-    fn default() -> Self {
-        Self {
-            enable_openai: false,
-            enable_anthropic: false,
-            enable_ollama: false,
-            enable_bedrock: false,
-            enable_vertex: false,
-            admin_enabled: false,
-            guardrails: None,
-            rate_limit: None,
-            model_selection: None,
-            routing: None,
-            openai_extra_keys: None,
-            config_path: String::new(),
-            tls: None,
-        }
-    }
 }
 
 impl TestHarnessBuilder {

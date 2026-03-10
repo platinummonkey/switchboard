@@ -263,7 +263,7 @@ async fn test_e2e_model_selection_allowed_models_rejects_disallowed() {
 
     let status = resp.status().as_u16();
     assert!(
-        status >= 400 && status < 600,
+        (400..600).contains(&status),
         "request with unregistered body model and rejected header override must return an error, got {}",
         status
     );

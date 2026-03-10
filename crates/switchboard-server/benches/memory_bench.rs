@@ -70,6 +70,8 @@ fn bench_app_state() -> Arc<AppState> {
         providers: Arc::new(ProviderRegistry::new()),
         key_pools: Arc::new(HashMap::new()),
         usage: Arc::new(UsageTracker::new()),
+        rate_limit_handle: None,
+        health_checker: Arc::new(switchboard_server::routing::ProviderHealthChecker::new()),
     })
 }
 

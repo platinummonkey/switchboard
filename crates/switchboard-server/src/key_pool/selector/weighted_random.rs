@@ -26,8 +26,8 @@ impl KeySelector for WeightedRandomSelector {
             return None;
         }
         let total: f64 = candidates.iter().map(|(_, w)| w).sum();
-        let mut rng = rand::thread_rng();
-        let mut target = rng.r#gen::<f64>() * total;
+        let mut rng = rand::rng();
+        let mut target = rng.random::<f64>() * total;
         for (idx, weight) in &candidates {
             target -= weight;
             if target <= 0.0 {

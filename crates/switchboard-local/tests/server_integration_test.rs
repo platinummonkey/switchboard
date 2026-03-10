@@ -645,15 +645,10 @@ async fn test_local_timeout_on_slow_server() {
     let black_hole_addr = black_hole.local_addr().expect("no local addr");
 
     tokio::spawn(async move {
-        loop {
-            match black_hole.accept().await {
-                Ok((_stream, _peer)) => {
-                    // Hold the connection open for a long time — never write
-                    // a single byte back.
-                    tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-                }
-                Err(_) => break,
-            }
+        while let Ok((_stream, _peer)) = black_hole.accept().await {
+            // Hold the connection open for a long time — never write
+            // a single byte back.
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
         }
     });
 

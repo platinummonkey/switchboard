@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use jsonwebtoken::{DecodingKey, Validation, decode};
+use jsonwebtoken;
 use serde::Deserialize;
 use tokio::sync::RwLock;
 use tracing::instrument;
@@ -97,14 +97,8 @@ fn run_token_command(cmd: &str) -> Result<String, LocalError> {
 /// We intentionally skip signature validation here — we only need the expiry
 /// time to schedule a refresh.  The server will perform full validation.
 fn extract_exp(token: &str) -> Option<i64> {
-    // Use `dangerous_insecure_decode` via validation with all checks disabled.
-    let mut validation = Validation::default();
-    validation.insecure_disable_signature_validation();
-    validation.validate_exp = false;
-    validation.validate_aud = false;
-    validation.required_spec_claims.clear();
-
-    decode::<JwtExp>(token, &DecodingKey::from_secret(&[]), &validation)
+    // Use `dangerous::insecure_decode` which skips signature validation.
+    jsonwebtoken::dangerous::insecure_decode::<JwtExp>(token)
         .ok()
         .and_then(|td| td.claims.exp)
 }
@@ -863,7 +857,7 @@ mod tests {
             .expect("rcgen generate failed");
 
         let cert_pem = cert_key.cert.pem();
-        let key_pem = cert_key.key_pair.serialize_pem();
+        let key_pem = cert_key.signing_key.serialize_pem();
 
         let mut cert_file = NamedTempFile::new().unwrap();
         cert_file.write_all(cert_pem.as_bytes()).unwrap();

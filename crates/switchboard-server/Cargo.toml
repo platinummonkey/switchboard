@@ -32,6 +32,7 @@ reqwest = { workspace = true }
 
 # gRPC
 tonic = { workspace = true }
+tonic-prost = "0.14"
 prost = { workspace = true }
 
 # AWS
@@ -94,7 +95,7 @@ x509-parser = { workspace = true }
 hyper-util = { workspace = true }
 
 [build-dependencies]
-tonic-build = "0.12"
+tonic-prost-build = "0.14"
 
 [dev-dependencies]
 wiremock = { workspace = true }

@@ -29,7 +29,9 @@ fn generate_test_certs(client_cn: &str) -> (String, String, String, String, Stri
     // Install the ring crypto provider for rustls (no-op if already installed).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SanType};
+    use rcgen::{
+        BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair, SanType,
+    };
 
     // ── CA ────────────────────────────────────────────────────────────────────
     let ca_key = KeyPair::generate().expect("generate CA key pair");
@@ -38,9 +40,8 @@ fn generate_test_certs(client_cn: &str) -> (String, String, String, String, Stri
     ca_params
         .distinguished_name
         .push(DnType::CommonName, "Test CA");
-    let ca_cert = ca_params
-        .self_signed(&ca_key)
-        .expect("generate self-signed CA cert");
+    let ca_issuer =
+        CertifiedIssuer::self_signed(ca_params, ca_key).expect("generate self-signed CA cert");
 
     // ── Server cert (signed by CA, SAN = localhost + 127.0.0.1) ─────────────
     // Include the IP address as a SAN so that reqwest accepts the certificate
@@ -55,7 +56,7 @@ fn generate_test_certs(client_cn: &str) -> (String, String, String, String, Stri
         .distinguished_name
         .push(DnType::CommonName, "switchboard-test-server");
     let server_cert = server_params
-        .signed_by(&server_key, &ca_cert, &ca_key)
+        .signed_by(&server_key, &ca_issuer)
         .expect("sign server cert with CA");
 
     // ── Client cert (signed by CA, CN = client_cn) ────────────────────────────
@@ -65,11 +66,11 @@ fn generate_test_certs(client_cn: &str) -> (String, String, String, String, Stri
         .distinguished_name
         .push(DnType::CommonName, client_cn);
     let client_cert = client_params
-        .signed_by(&client_key, &ca_cert, &ca_key)
+        .signed_by(&client_key, &ca_issuer)
         .expect("sign client cert with CA");
 
     (
-        ca_cert.pem(),
+        ca_issuer.pem(),
         server_cert.pem(),
         server_key.serialize_pem(),
         client_cert.pem(),
