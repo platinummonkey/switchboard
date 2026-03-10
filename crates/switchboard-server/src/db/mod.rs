@@ -46,9 +46,7 @@ impl DbPool {
                 .acquire_timeout(timeout)
                 .connect(url)
                 .await
-                .map_err(|e| {
-                    ServerError::Database(format!("read pool connect ({url}): {e}"))
-                })?;
+                .map_err(|e| ServerError::Database(format!("read pool connect ({url}): {e}")))?;
             read.push(pool);
         }
 

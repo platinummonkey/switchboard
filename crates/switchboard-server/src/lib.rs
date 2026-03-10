@@ -489,7 +489,12 @@ async fn apply_db_overrides(
             continue;
         };
 
-        if let Some(entry) = provider_cfg.key_pool.keys.iter_mut().find(|k| k.id == row.id) {
+        if let Some(entry) = provider_cfg
+            .key_pool
+            .keys
+            .iter_mut()
+            .find(|k| k.id == row.id)
+        {
             // Update weight on an existing TOML key.
             entry.weight = row.weight;
             tracing::debug!(key_id = %row.id, weight = row.weight, "updated key weight from DB");

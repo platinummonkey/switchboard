@@ -127,15 +127,13 @@ pub async fn delete_key_pool_entry(
     provider_id: &str,
     id: &str,
 ) -> Result<(), ServerError> {
-    sqlx::query(
-        "DELETE FROM key_pool_entries WHERE provider_id = $1 AND id = $2",
-    )
-    .bind(provider_id)
-    .bind(id)
-    .execute(pool)
-    .await
-    .map(|_| ())
-    .map_err(|e| ServerError::Database(e.to_string()))
+    sqlx::query("DELETE FROM key_pool_entries WHERE provider_id = $1 AND id = $2")
+        .bind(provider_id)
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| ServerError::Database(e.to_string()))
 }
 
 // ── rate_limit_overrides ──────────────────────────────────────────────────────

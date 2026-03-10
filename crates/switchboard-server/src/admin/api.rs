@@ -191,7 +191,8 @@ pub async fn add_provider_key(
     let eweight = entry.weight;
     let sc = source_config.clone();
     if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
-        queries::upsert_key_pool_entry(db.write(), &pid, &eid, &etype, eweight, "healthy", &sc).await
+        queries::upsert_key_pool_entry(db.write(), &pid, &eid, &etype, eweight, "healthy", &sc)
+            .await
     })
     .await
     {
