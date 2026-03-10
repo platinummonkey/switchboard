@@ -379,5 +379,3 @@ switchboard/
 ## License
 
 Apache 2.0 — see LICENSE.
-
-Built by the Datadog Platform Team.
