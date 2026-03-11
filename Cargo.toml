@@ -77,9 +77,6 @@ anyhow = "1"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
-# Static assets (admin UI)
-rust-embed = { version = "8", features = ["compression"] }
-
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 bytes = "1"

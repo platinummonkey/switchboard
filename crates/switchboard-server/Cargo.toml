@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [features]
 default = ["admin-ui"]
-admin-ui = ["rust-embed", "mime_guess"]
+admin-ui = []
 
 [dependencies]
 switchboard-common = { path = "../switchboard-common" }
@@ -69,9 +69,6 @@ anyhow = { workspace = true }
 # CLI
 clap = { workspace = true }
 
-# Static assets (admin UI)
-rust-embed = { workspace = true, optional = true }
-mime_guess = { version = "2", optional = true }
 
 # Utilities
 uuid = { workspace = true }
@@ -105,7 +102,6 @@ tokio = { workspace = true }
 tempfile = "3"
 toml = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
-rust-embed = { workspace = true }
 criterion = { version = "0.5", features = ["async_tokio"] }
 libc = { workspace = true }
 rcgen = { workspace = true }
