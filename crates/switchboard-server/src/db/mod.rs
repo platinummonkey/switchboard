@@ -91,20 +91,26 @@ impl DbPool {
 
     /// Run all pending migrations against the write pool.
     ///
-    /// Uses a blocking `diesel::PgConnection` via `spawn_blocking` because
-    /// `MigrationHarness` does not support async connections.
+    /// Uses [`diesel_async::async_connection_wrapper::AsyncConnectionWrapper`] so
+    /// that the pure-Rust `AsyncPgConnection` (tokio-postgres) handles the
+    /// connection — no libpq required.
     pub async fn migrate(&self, write_url: &str) -> Result<(), ServerError> {
-        let url = write_url.to_string();
-        tokio::task::spawn_blocking(move || {
-            use diesel::Connection;
-            let mut conn = diesel::PgConnection::establish(&url)
+        use diesel_async::AsyncConnection;
+        use diesel_async::async_connection_wrapper::AsyncConnectionWrapper;
+
+        let mut conn: AsyncConnectionWrapper<AsyncPgConnection> =
+            AsyncConnectionWrapper::establish(write_url)
+                .await
                 .map_err(|e| ServerError::Database(format!("migration connect: {e}")))?;
+
+        tokio::task::spawn_blocking(move || {
             conn.run_pending_migrations(MIGRATIONS)
                 .map_err(|e| ServerError::Database(format!("migration failed: {e}")))?;
             Ok::<_, ServerError>(())
         })
         .await
         .map_err(|e| ServerError::Database(format!("spawn_blocking join error: {e}")))??;
+
         tracing::info!("database migrations applied");
         Ok(())
     }

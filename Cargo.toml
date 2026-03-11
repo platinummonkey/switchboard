@@ -68,7 +68,7 @@ rcgen = "0.14"
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto"] }
 
 # Auth / JWT
-jsonwebtoken = "10"
+jsonwebtoken = { version = "10", features = ["use_pem", "aws_lc_rs"] }
 
 # Error handling
 thiserror = "2"
@@ -92,7 +92,7 @@ subtle = "2"
 libc = "0.2"
 
 # Database
-diesel = { version = "2", features = ["postgres", "chrono"] }
+diesel = { version = "2", features = ["postgres_backend", "chrono"] }
 diesel-async = { version = "0.5", features = ["postgres", "deadpool", "async-connection-wrapper"] }
 diesel_migrations = "2"
 
