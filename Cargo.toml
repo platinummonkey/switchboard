@@ -60,7 +60,7 @@ opentelemetry-semantic-conventions = "0.31"
 # TLS
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
-rustls-pemfile = "2"
+pem-rfc7468 = { version = "0.7", features = ["alloc"] }
 x509-parser = "0.18"
 rcgen = "0.14"
 

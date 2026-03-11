@@ -90,7 +90,7 @@ http = "1"
 async-stream = "0.3"
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+pem-rfc7468 = { workspace = true }
 x509-parser = { workspace = true }
 hyper-util = { workspace = true }
 

@@ -5,15 +5,71 @@
 //! - [`extract_cn_from_tls_stream`] — extracts the Common Name from the peer certificate
 //!   after a successful mTLS handshake
 
-use std::io::BufReader;
 use std::sync::Arc;
 
 use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{
+    CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
+};
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::ServerListenConfig;
 use crate::error::ServerError;
+
+/// Decode all PEM blocks from `data`, yielding `(label, DER bytes)` for each.
+fn decode_pem_blocks(data: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let text = match std::str::from_utf8(data) {
+        Ok(s) => s,
+        Err(_) => return vec![],
+    };
+    let mut results = Vec::new();
+    let mut remaining = text;
+    while let Some(begin) = remaining.find("-----BEGIN ") {
+        let block = &remaining[begin..];
+        if let Some(end_line_start) = block.find("\n-----END ") {
+            let end_line_end = block[end_line_start + 1..]
+                .find('\n')
+                .map(|p| end_line_start + 1 + p + 1)
+                .unwrap_or(block.len());
+            let block_str = &block[..end_line_end];
+            if let Ok((label, der)) = pem_rfc7468::decode_vec(block_str.as_bytes()) {
+                results.push((label.to_string(), der));
+            }
+            remaining = &block[end_line_end..];
+        } else {
+            break;
+        }
+    }
+    results
+}
+
+fn parse_certs(pem_data: &[u8]) -> Result<Vec<CertificateDer<'static>>, ServerError> {
+    let certs = decode_pem_blocks(pem_data)
+        .into_iter()
+        .filter(|(label, _)| label == "CERTIFICATE")
+        .map(|(_, der)| CertificateDer::from(der))
+        .collect::<Vec<_>>();
+    if certs.is_empty() {
+        return Err(ServerError::Config(
+            "no certificates found in PEM data".into(),
+        ));
+    }
+    Ok(certs)
+}
+
+fn parse_private_key(pem_data: &[u8]) -> Result<PrivateKeyDer<'static>, ServerError> {
+    for (label, der) in decode_pem_blocks(pem_data) {
+        match label.as_str() {
+            "PRIVATE KEY" => return Ok(PrivatePkcs8KeyDer::from(der).into()),
+            "RSA PRIVATE KEY" => return Ok(PrivatePkcs1KeyDer::from(der).into()),
+            "EC PRIVATE KEY" => return Ok(PrivateSec1KeyDer::from(der).into()),
+            _ => {}
+        }
+    }
+    Err(ServerError::Config(
+        "no private key found in tls_key_path".into(),
+    ))
+}
 
 /// Build a [`TlsAcceptor`] from the PEM files configured in [`ServerListenConfig`].
 ///
@@ -32,19 +88,14 @@ pub async fn build_tls_acceptor(
     let cert_bytes = tokio::fs::read(cert_path)
         .await
         .map_err(|e| ServerError::Config(format!("read tls_cert_path: {e}")))?;
-    let mut cert_reader = BufReader::new(cert_bytes.as_slice());
-    let cert_chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-        .collect::<Result<_, _>>()
+    let cert_chain = parse_certs(&cert_bytes)
         .map_err(|e| ServerError::Config(format!("parse TLS cert: {e}")))?;
 
     // Read private key.
     let key_bytes = tokio::fs::read(key_path)
         .await
         .map_err(|e| ServerError::Config(format!("read tls_key_path: {e}")))?;
-    let mut key_reader = BufReader::new(key_bytes.as_slice());
-    let private_key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut key_reader)
-        .map_err(|e| ServerError::Config(format!("parse TLS key: {e}")))?
-        .ok_or_else(|| ServerError::Config("no private key found in tls_key_path".into()))?;
+    let private_key: PrivateKeyDer<'static> = parse_private_key(&key_bytes)?;
 
     // Build rustls ServerConfig.
     let server_config = if let Some(ca_path) = &config.mtls_ca_path {
@@ -52,9 +103,7 @@ pub async fn build_tls_acceptor(
         let ca_bytes = tokio::fs::read(ca_path)
             .await
             .map_err(|e| ServerError::Config(format!("read mtls_ca_path: {e}")))?;
-        let mut ca_reader = BufReader::new(ca_bytes.as_slice());
-        let ca_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut ca_reader)
-            .collect::<Result<_, _>>()
+        let ca_certs = parse_certs(&ca_bytes)
             .map_err(|e| ServerError::Config(format!("parse mTLS CA cert: {e}")))?;
 
         let mut root_store = rustls::RootCertStore::empty();

@@ -58,7 +58,7 @@ chrono = { workspace = true }
 http = "1"
 libc = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
+pem-rfc7468 = { workspace = true }
 
 # Config parsing (also needed at runtime for load())
 toml = { workspace = true }
