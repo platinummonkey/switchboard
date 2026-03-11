@@ -54,7 +54,7 @@ fn test_ui_assets_embedded() {
     assert!(asset.is_some(), "index.html must be embedded in the binary");
 
     let bytes = asset.unwrap().data;
-    let text = std::str::from_utf8(&bytes).expect("index.html must be valid UTF-8");
+    let text = std::str::from_utf8(bytes).expect("index.html must be valid UTF-8");
     assert!(
         text.contains("Switchboard Admin"),
         "index.html must contain 'Switchboard Admin'; got: {text:.200}"

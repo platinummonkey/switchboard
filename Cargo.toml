@@ -92,7 +92,9 @@ subtle = "2"
 libc = "0.2"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "json", "chrono", "migrate"] }
+diesel = { version = "2", features = ["postgres", "chrono"] }
+diesel-async = { version = "0.5", features = ["postgres", "deadpool", "async-connection-wrapper"] }
+diesel_migrations = "2"
 
 # Testing
 wiremock = "0.6"

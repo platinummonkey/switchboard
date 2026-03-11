@@ -191,8 +191,8 @@ pub async fn add_provider_key(
     let eweight = entry.weight;
     let sc = source_config.clone();
     if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
-        queries::upsert_key_pool_entry(db.write(), &pid, &eid, &etype, eweight, "healthy", &sc)
-            .await
+        let mut conn = db.write().await?;
+        queries::upsert_key_pool_entry(&mut conn, &pid, &eid, &etype, eweight, "healthy", &sc).await
     })
     .await
     {
@@ -288,7 +288,8 @@ pub async fn delete_provider_key(
     let pid = provider_id.clone();
     let kid = key_id.clone();
     if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
-        queries::delete_key_pool_entry(db.write(), &pid, &kid).await
+        let mut conn = db.write().await?;
+        queries::delete_key_pool_entry(&mut conn, &pid, &kid).await
     })
     .await
     {
@@ -367,11 +368,12 @@ pub async fn update_provider_key(
     let kid = key_id.clone();
     let update2 = update.clone();
     if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
+        let mut conn = db.write().await?;
         if let Some(w) = update2.weight {
-            queries::update_key_weight(db.write(), &pid, &kid, w).await?;
+            queries::update_key_weight(&mut conn, &pid, &kid, w).await?;
         }
         if let Some(ref s) = update2.status {
-            queries::update_key_status(db.write(), &pid, &kid, s).await?;
+            queries::update_key_status(&mut conn, &pid, &kid, s).await?;
         }
         Ok(())
     })
@@ -487,7 +489,8 @@ pub async fn put_model_selection(
         }
     };
     if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
-        queries::upsert_config_override(db.write(), "model_selection", &json).await
+        let mut conn = db.write().await?;
+        queries::upsert_config_override(&mut conn, "model_selection", &json).await
     })
     .await
     {
@@ -544,7 +547,8 @@ pub async fn put_guardrails(
         }
     };
     if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
-        queries::upsert_config_override(db.write(), "guardrails", &json).await
+        let mut conn = db.write().await?;
+        queries::upsert_config_override(&mut conn, "guardrails", &json).await
     })
     .await
     {
@@ -680,7 +684,8 @@ pub async fn put_semantic_routing(
         }
     };
     if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
-        queries::upsert_config_override(db.write(), "routing", &json).await
+        let mut conn = db.write().await?;
+        queries::upsert_config_override(&mut conn, "routing", &json).await
     })
     .await
     {
@@ -759,8 +764,9 @@ pub async fn set_rate_limit_override(
     // 1. Write to DB first (if enabled).
     let db_id = id.clone();
     if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
+        let mut conn = db.write().await?;
         queries::upsert_rate_limit_override(
-            db.write(),
+            &mut conn,
             &db_id,
             settings.rpm as i32,
             settings.tpm as i32,
@@ -801,7 +807,8 @@ pub async fn delete_rate_limit_override(
     // 1. Write to DB first (if enabled).
     let db_id = id.clone();
     if let Some(err) = db_write_or_err(state.db_pool.clone(), move |db| async move {
-        queries::delete_rate_limit_override(db.write(), &db_id).await
+        let mut conn = db.write().await?;
+        queries::delete_rate_limit_override(&mut conn, &db_id).await
     })
     .await
     {

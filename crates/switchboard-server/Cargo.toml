@@ -82,7 +82,9 @@ dashmap = { workspace = true }
 arc-swap = { workspace = true }
 rand = { workspace = true }
 subtle = { workspace = true }
-sqlx = { workspace = true }
+diesel = { workspace = true }
+diesel-async = { workspace = true }
+diesel_migrations = { workspace = true }
 http = "1"
 async-stream = "0.3"
 rustls = { workspace = true }

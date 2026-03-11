@@ -428,7 +428,7 @@ async fn apply_db_overrides(
     use crate::db::queries;
 
     // ── Rate limit overrides ────────────────────────────────────────────────
-    let rl_rows = queries::list_rate_limit_overrides(pool.read()).await?;
+    let rl_rows = queries::list_rate_limit_overrides(&mut *pool.read().await?).await?;
     for row in rl_rows {
         config.rate_limit.overrides.insert(
             row.id.clone(),
@@ -442,11 +442,13 @@ async fn apply_db_overrides(
 
     // ── Config section overrides ────────────────────────────────────────────
     for section in ["model_selection", "guardrails", "routing"] {
-        let Some(row) = queries::get_config_override(pool.read(), section).await? else {
+        let Some(row) = queries::get_config_override(&mut *pool.read().await?, section).await?
+        else {
             continue;
         };
+        let config_json = row.config_json.0.clone();
         match section {
-            "model_selection" => match serde_json::from_value(row.config_json) {
+            "model_selection" => match serde_json::from_value(config_json) {
                 Ok(ms) => {
                     config.model_selection = ms;
                     tracing::info!("applied model_selection override from DB");
@@ -455,7 +457,7 @@ async fn apply_db_overrides(
                     tracing::warn!(section, error = %e, "failed to deserialize config override, skipping");
                 }
             },
-            "guardrails" => match serde_json::from_value(row.config_json) {
+            "guardrails" => match serde_json::from_value(config_json) {
                 Ok(g) => {
                     config.guardrails = g;
                     tracing::info!("applied guardrails override from DB");
@@ -464,7 +466,7 @@ async fn apply_db_overrides(
                     tracing::warn!(section, error = %e, "failed to deserialize config override, skipping");
                 }
             },
-            "routing" => match serde_json::from_value(row.config_json) {
+            "routing" => match serde_json::from_value(config_json) {
                 Ok(r) => {
                     config.routing = r;
                     tracing::info!("applied routing override from DB");
@@ -478,7 +480,7 @@ async fn apply_db_overrides(
     }
 
     // ── Key pool entries ────────────────────────────────────────────────────
-    let key_rows = queries::list_key_pool_entries(pool.read()).await?;
+    let key_rows = queries::list_key_pool_entries(&mut *pool.read().await?).await?;
     for row in key_rows {
         let Some(provider_cfg) = config.providers.get_mut(&row.provider_id) else {
             tracing::warn!(
@@ -500,23 +502,18 @@ async fn apply_db_overrides(
             tracing::debug!(key_id = %row.id, weight = row.weight, "updated key weight from DB");
         } else if row.key_type != "static" {
             // Reconstruct non-static keys from source_config.
+            let sc = row.source_config.0;
             let entry = crate::config::provider::KeyEntry {
                 id: row.id.clone(),
                 key_type: row.key_type.clone(),
                 api_key: None,
-                role_arn: row
-                    .source_config
+                role_arn: sc
                     .get("role_arn")
                     .and_then(|v| v.as_str())
                     .map(str::to_owned),
-                region: row
-                    .source_config
-                    .get("region")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned),
+                region: sc.get("region").and_then(|v| v.as_str()).map(str::to_owned),
                 refresh_interval: None,
-                vault_path: row
-                    .source_config
+                vault_path: sc
                     .get("vault_path")
                     .and_then(|v| v.as_str())
                     .map(str::to_owned),
@@ -584,7 +581,7 @@ pub async fn run_server(
         tracing::info!("database enabled, connecting...");
         let pool = DbPool::connect(&config.database).await?;
         if config.database.auto_migrate {
-            pool.migrate().await?;
+            pool.migrate(&config.database.write_url).await?;
         }
         apply_db_overrides(&pool, &mut config).await?;
         tracing::info!("database overrides applied");
