@@ -2,7 +2,7 @@
 #
 # Builds both switchboard-server and switchboard-local release binaries inside
 # the official Rust image so the host doesn't need a Rust toolchain.
-FROM rust:1.85-bookworm AS builder
+FROM rust:latest AS builder
 
 WORKDIR /build
 
